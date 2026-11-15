@@ -32,9 +32,13 @@ internal sealed class OperatorSession(PilotCore core)
     public bool IsTesting(string id) => simulations.ContainsKey(id);
     public (string Chat, string Next) Text(string id) => texts.GetValueOrDefault(id, ("", ""));
 
-    public void SetText(IEnumerable<string> ids, string chat, string next)
+    public void SetText(IEnumerable<string> ids, string? chat, string? next)
     {
-        foreach (string id in ids) texts[id] = (chat, next);
+        foreach (string id in ids)
+        {
+            var previous = Text(id);
+            texts[id] = (chat ?? previous.Chat, next ?? previous.Next);
+        }
     }
 
     public void Start(IEnumerable<string> ids, Simulation simulation)
@@ -47,32 +51,47 @@ internal sealed class OperatorSession(PilotCore core)
         foreach (string id in ids) simulations.Remove(id);
     }
 
-    public void Update(MixerState atem, MixerState vmix, long now)
+    public void Update(MixerState atem, MixerState vmix, long now, ArbiterState? arbiter = null)
     {
         foreach (var pager in core.Devices)
         {
             var inside = pager.Inside ?? DefaultInside;
             var outside = pager.Outside ?? DefaultOutside;
             var (chat, next) = Text(pager.Id);
+            string insideSource = Label(inside.Mixer);
+            string outsideSource = Label(outside.Mixer);
             if (simulations.TryGetValue(pager.Id, out var simulation))
             {
                 var (a, v, pause) = simulation.State(now);
                 int Simulate(Assignment assignment) => assignment.Mixer switch
                 {
-                    MixerKind.Atem => a, MixerKind.Vmix => v, _ => 0
+                    MixerKind.Atem or MixerKind.ArbiterAtem => a,
+                    MixerKind.Vmix or MixerKind.ArbiterVmix => v, _ => 0
                 };
-                core.SetPreview(pager.Id, new(Simulate(inside), Simulate(outside), chat, next, Test: true), pause);
+                core.SetPreview(pager.Id, new(Simulate(inside), Simulate(outside), chat, next, true,
+                    insideSource, outsideSource), pause);
             }
-            else core.SetPreview(pager.Id, new(Resolve(inside, atem, vmix), Resolve(outside, atem, vmix), chat, next));
+            else core.SetPreview(pager.Id, new(Resolve(inside, atem, vmix, arbiter), Resolve(outside, atem, vmix, arbiter),
+                chat, next, false, insideSource, outsideSource));
         }
     }
 
-    internal static int Resolve(Assignment assignment, MixerState atem, MixerState vmix) => assignment.Mixer switch
+    internal static string Label(MixerKind kind) => kind switch
+    {
+        MixerKind.Atem or MixerKind.ArbiterAtem => "ATEM",
+        MixerKind.Vmix or MixerKind.ArbiterVmix => "vMix",
+        MixerKind.Arbiter => "Tally Arbiter",
+        _ => "off"
+    };
+
+    internal static int Resolve(Assignment assignment, MixerState atem, MixerState vmix, ArbiterState? arbiter) => assignment.Mixer switch
     {
         MixerKind.Atem => atem.Inputs.FirstOrDefault(input => input.Number == assignment.Input)?.Tally ?? 0,
         MixerKind.Vmix when assignment.Key is { Length: > 0 } key =>
             vmix.Inputs.FirstOrDefault(input => string.Equals(input.Key, key, StringComparison.OrdinalIgnoreCase))?.Tally ?? 0,
         MixerKind.Vmix => vmix.Inputs.FirstOrDefault(input => input.Number == assignment.Input)?.Tally ?? 0,
+        MixerKind.Arbiter or MixerKind.ArbiterAtem or MixerKind.ArbiterVmix =>
+            arbiter?.For(assignment.Mixer).FirstOrDefault(input => input.Key == assignment.Key)?.Tally ?? 0,
         _ => 0
     };
 }

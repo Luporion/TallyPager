@@ -16,12 +16,14 @@ constexpr char hexDigits[] = "0123456789abcdef";
 WiFiUDP udp;
 IPAddress core;
 String deviceId, name, ssid, password, nonce, session, cue, next, serialLine;
+String insideSource = "off", outsideSource = "off";
 uint8_t key[32]{};
 uint8_t inside = 0, outside = 0;
 uint32_t sequence = 0, lastState = 0, offeredAt = 0, lastSend = 0, lastDraw = 0;
 uint32_t restartAt = 0;
 uint32_t lastPing = 0, pendingPing = 0, lastPong = 0, telemetrySequence = 0;
 uint32_t lastLinkCheck = 0;
+uint32_t connectedAt = 0;
 int rtt = -1;
 bool configured = false, udpReady = false, diagnostics = false, dirty = true, serialOverflow = false;
 bool testMode = false;
@@ -81,6 +83,7 @@ void newSession() {
   nonce = hex(random, sizeof(random));
   session = "";
   sequence = 0;
+  connectedAt = 0;
   lastSend = 0;
   lastPing = pendingPing = lastPong = telemetrySequence = 0;
   rtt = -1;
@@ -115,10 +118,10 @@ void receive(uint32_t now) {
     if (boundary < 0) continue;
     const String body = packet.substring(0, boundary);
     if (!equalTag(packet.substring(boundary + 1), tag(body))) continue;
-    String fields[10];
+    String fields[12];
     size_t count = 0;
     int start = 0;
-    for (; count < 10; ++count) {
+    for (; count < 12; ++count) {
       int end = body.indexOf('|', start);
       fields[count] = end < 0 ? body.substring(start) : body.substring(start, end);
       if (end < 0) { ++count; break; }
@@ -140,7 +143,7 @@ void receive(uint32_t now) {
       pendingPing = 0;
       dirty = true;
     }
-    if ((count != 9 && count != 10) || fields[1] != "state" || session.isEmpty() || fields[3] != session) continue;
+    if ((count != 9 && count != 10 && count != 12) || fields[1] != "state" || session.isEmpty() || fields[3] != session) continue;
     char* end = nullptr;
     unsigned long number = strtoul(fields[4].c_str(), &end, 10);
     if (*end || number <= sequence || fields[5].length() != 1 || fields[6].length() != 1) continue;
@@ -148,10 +151,16 @@ void receive(uint32_t now) {
     String newCue, newNext;
     if (newInside < 0 || newInside > 3 || newOutside < 0 || newOutside > 3 ||
         !decodeText(fields[7], newCue, 160) || !decodeText(fields[8], newNext, 80)) continue;
-    bool simulation = count == 10 && fields[9] == "test";
+    bool simulation = count >= 10 && fields[9] == "test";
+    String newInsideSource = count == 12 ? fields[10] : "Innen";
+    String newOutsideSource = count == 12 ? fields[11] : "Aussen";
+    if (newInsideSource.length() > 13 || newOutsideSource.length() > 13) continue;
+    if (sequence == 0) connectedAt = now;
     dirty |= sequence == 0 || newInside != inside || newOutside != outside || cue != newCue ||
-        next != newNext || simulation != testMode;
+        next != newNext || simulation != testMode || insideSource != newInsideSource || outsideSource != newOutsideSource;
     testMode = simulation;
+    insideSource = newInsideSource;
+    outsideSource = newOutsideSource;
     sequence = number;
     lastState = now;
     inside = newInside;
@@ -252,6 +261,8 @@ void status() {
   doc["test"] = testMode;
   doc["inside"] = inside;
   doc["outside"] = outside;
+  doc["insideSource"] = insideSource;
+  doc["outsideSource"] = outsideSource;
   doc["cue"] = cue;
   doc["next"] = next;
   Serial.print("TP ");
@@ -293,6 +304,10 @@ bool linkDelayed() {
   return sequence && (millis() - lastState >= 750 || rtt >= 250);
 }
 
+bool showReconnectNotice() {
+  return sequence && millis() - connectedAt < 2200;
+}
+
 String displayText(String text) {
   text.replace("ä", "ae"); text.replace("ö", "oe"); text.replace("ü", "ue");
   text.replace("Ä", "Ae"); text.replace("Ö", "Oe"); text.replace("Ü", "Ue"); text.replace("ß", "ss");
@@ -315,8 +330,10 @@ void draw() {
     display.drawString("RSSI: " + String(WiFi.RSSI()) + " dBm", 5, 96);
     display.drawString(String("Akku: ") + StickCP2.Power.getBatteryLevel() + "%", 5, 114);
   } else {
-    display.fillScreen(colors[outside]);
-    display.fillRect(6, 18, 228, 100, colors[inside]);
+    const bool showInside = insideSource != "off";
+    const bool showOutside = outsideSource != "off";
+    display.fillScreen(showOutside ? colors[outside] : TFT_BLACK);
+    display.fillRect(6, 18, 228, 100, showInside ? colors[inside] : TFT_BLACK);
     display.setTextColor(TFT_WHITE);
     String headline = next.isEmpty() ? name : "next: " + displayText(next);
     if (testMode) headline = "TEST " + headline;
@@ -329,18 +346,21 @@ void draw() {
       display.fillRect(128 + i * 5, 14 - height, 3, height, i < bars ? TFT_GREEN : 0x4208);
     }
     display.setTextColor(!sequence ? TFT_LIGHTGREY : delayed ? TFT_ORANGE : TFT_WHITE);
-    String connection = !sequence ? "Getrennt" : delayed ? "Delayed" : "Verbunden";
-    if (rtt >= 0) connection += " " + String(rtt) + "ms";
+    String connection = !sequence ? "Getrennt" : delayed ? "Delayed" : showReconnectNotice() ? "Verbunden" : "";
+    if (rtt >= 0) {
+      if (!connection.isEmpty()) connection += " ";
+      connection += String(rtt) + "ms";
+    }
     display.drawString(connection, 148, 5);
     display.setTextColor(TFT_WHITE);
-    display.drawString(String("Aussen: ") + states[outside], 6, 123);
-    display.drawString(String("Innen: ") + states[inside], 12, 102);
+    if (showOutside) display.drawString(outsideSource + ": " + states[outside], 6, 123);
+    if (showInside) display.drawString(insideSource + ": " + states[inside], 12, 102);
     if (!configured || sequence == 0) {
       const char* message = !configured ? "USB-Setup starten" :
           (WiFi.status() == WL_CONNECTED ? "Core offline" : "WLAN nicht verbunden");
       display.drawString(message, 12, 38);
     } else {
-      display.setTextColor(inside >= 2 ? TFT_BLACK : TFT_WHITE);
+      display.setTextColor(showInside && inside >= 2 ? TFT_BLACK : TFT_WHITE);
       display.setCursor(12, 27);
       display.setTextSize(2);
       String text = displayText(cue);
@@ -400,11 +420,14 @@ void loop() {
     lastLinkCheck = now;
     static int previousBars = -2;
     static bool previousDelay = false;
+    static bool previousNotice = false;
     int bars = qualityBars();
     bool delayed = linkDelayed();
-    dirty |= bars != previousBars || delayed != previousDelay;
+    bool notice = showReconnectNotice();
+    dirty |= bars != previousBars || delayed != previousDelay || notice != previousNotice;
     previousBars = bars;
     previousDelay = delayed;
+    previousNotice = notice;
   }
   if (dirty || (diagnostics && now - lastDraw >= 1000)) {
     draw();

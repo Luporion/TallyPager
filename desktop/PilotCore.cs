@@ -7,10 +7,11 @@ using System.Text.Json;
 
 namespace TallyPager;
 
-internal enum MixerKind { Off, Atem, Vmix }
+internal enum MixerKind { Off, Atem, Vmix, Arbiter, ArbiterAtem, ArbiterVmix }
 internal sealed record Assignment(MixerKind Mixer, int Input, string? Key = null);
 internal sealed record Pager(string Id, string Name, string Key, Assignment? Inside = null, Assignment? Outside = null);
-internal sealed record Preview(int Inside, int Outside, string Chat, string Next, bool Test = false)
+internal sealed record Preview(int Inside, int Outside, string Chat, string Next, bool Test = false,
+    string InsideSource = "Innen", string OutsideSource = "Aussen")
 {
     public static Preview Clear { get; } = new(0, 0, "", "");
 }
@@ -214,7 +215,7 @@ internal sealed class PilotCore : IDisposable
         var preview = link.Preview;
         string body = FormattableString.Invariant(
             $"TP1|state|{link.Pager.Id}|{active.Session}|{++link.Sequence}|{preview.Inside}|{preview.Outside}|{TextHex(preview.Chat)}|{TextHex(preview.Next)}");
-        if (preview.Test) body += "|test";
+        body += $"|{(preview.Test ? "test" : "live")}|{preview.InsideSource}|{preview.OutsideSource}";
         Send(link, active.Endpoint, body);
         return link.Sequence;
     }

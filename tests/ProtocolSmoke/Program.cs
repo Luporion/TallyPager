@@ -6,6 +6,11 @@ using System.Text;
 using TallyPager;
 
 const string id = "123456789abc";
+if (args is ["--arbiter", var serverAddress])
+{
+    await TestArbiterSocket(serverAddress);
+    return;
+}
 string settings = Directory.CreateTempSubdirectory("tallypager-smoke-").FullName;
 try
 {
@@ -25,7 +30,7 @@ try
         firstSession = Connect(stick, core, key, new string('a', 32));
         core.SetPreview(id, new Preview(3, 2, "Kanzel enger", "Taufe"));
         var state = Read(stick, core, key);
-        Check(state is [_, "state", id, _, _, "3", "2", "4b616e7a656c20656e676572", "5461756665"],
+        Check(state is [_, "state", id, _, _, "3", "2", "4b616e7a656c20656e676572", "5461756665", "live", "Innen", "Aussen"],
             "Expected independent layers and Cue/Next");
 
         // Drop the first state from the simulated stick's perspective. A later
@@ -47,7 +52,8 @@ try
         Check(core.Statuses().Single() is { Connection: Connection.Delayed, Rssi: -67, Rtt: 280 },
             "Expected the same delayed status and telemetry as the stick");
         core.SetPreview(id, Preview.Clear);
-        Check(Read(stick, core, key)[5..].SequenceEqual(new[] { "0", "0", "", "" }), "Clear should overwrite Cue and Next");
+        Check(Read(stick, core, key)[5..].SequenceEqual(new[] { "0", "0", "", "", "live", "Innen", "Aussen" }),
+            "Clear should overwrite Chat and Next");
     }
     using (var restarted = new PilotCore(settings, port: 0))
     {
@@ -61,6 +67,7 @@ try
     }
     Console.WriteLine("PASS UDP pairing, invalid signature, independent tally, Cue/Next, lost snapshot, clear and Core restart");
     TestAssignments(settings);
+    TestArbiter();
     await TestVmix();
     using (var atem = new AtemSource("127.0.0.1"))
         Check(atem.State.Inputs.Length == 0, "An ATEM without a source must remain unknown");
@@ -138,19 +145,64 @@ static void TestAssignments(string settings)
     var session = new OperatorSession(core);
     session.SetText([left.Id], "Test", "Next");
     session.Update(atem, vmix, 1000);
-    Check(core.Statuses().First(s => s.Id == left.Id).View == new Preview(2, 3, "Test", "Next"),
+    Check(core.Statuses().First(s => s.Id == left.Id).View == new Preview(2, 3, "Test", "Next", false, "vMix", "ATEM"),
         "vMix GUID follows renumbering, inside/outside must be reversible");
-    Check(core.Statuses().First(s => s.Id == right.Id).View == new Preview(3, 0, "", ""),
+    Check(core.Statuses().First(s => s.Id == right.Id).View == new Preview(3, 0, "", "", false, "ATEM", "vMix"),
         "Chat and mappings must stay isolated per stick");
     session.Start([left.Id], new(Scenario.VmixOnOff, 500, 2, 0, 1000));
     session.Update(atem, vmix, 1500);
-    Check(core.Statuses().First(s => s.Id == left.Id).View == new Preview(1, 2, "Test", "Next", true),
+    Check(core.Statuses().First(s => s.Id == left.Id).View == new Preview(1, 2, "Test", "Next", true, "vMix", "ATEM"),
         "Interval simulation must follow the swapped display assignment");
     session.Stop([left.Id]);
     session.Update(atem, MixerState.Off, 2000);
-    Check(core.Statuses().First(s => s.Id == left.Id).View == new Preview(0, 3, "Test", "Next"),
+    Check(core.Statuses().First(s => s.Id == left.Id).View == new Preview(0, 3, "Test", "Next", false, "vMix", "ATEM"),
         "vMix loss must only affect the vMix layer");
+    core.Save(left with { Inside = new(MixerKind.Off, 0) });
+    session.SetText([right.Id], "Other", "Next B");
+    session.SetText([left.Id, right.Id], "Chat only", null);
+    session.SetText([left.Id], "", null);
+    session.Update(atem, vmix, 2200);
+    Check(core.Statuses().First(s => s.Id == left.Id).View == new Preview(0, 3, "", "Next", false, "off", "ATEM"),
+        "Disabled layer must be explicitly hidden and clearing Chat must preserve Next");
+    Check(session.Text(right.Id) == ("Chat only", "Next B"), "Group send must preserve each device's Next");
+    session.SetText([right.Id], null, "");
+    Check(session.Text(right.Id) == ("Chat only", ""), "Clearing Next must preserve Chat");
     Console.WriteLine("PASS separate devices, stable mapping, swapped layers and per-device interval simulation");
+}
+
+static void TestArbiter()
+{
+    Check(TallyArbiterSource.Endpoint("192.168.1.2")?.Port == 4455, "Wrong Tally Arbiter default port");
+    Check(TallyArbiterSource.Endpoint("localhost:18455")?.Port == 18455, "Explicit port was lost");
+    Check(TallyArbiterSource.Endpoint("https://arbiter.local")?.Scheme == "wss", "HTTPS should use secure WebSocket");
+    Check(TallyArbiterSource.Endpoint("http://user@arbiter.local:4455") is null, "Do not accept credentials in a source URL");
+    var cache = new ArbiterSnapshot();
+    void Feed(string json, long time = 1000) => cache.Accept(json.AsMemory(), time);
+    Feed("""["devices",[{"id":"cam","name":"Mobile Kamera","enabled":true}]]""");
+    Feed("""["device_states",[{"deviceId":"cam","busId":"p","sources":["a1"]},{"deviceId":"cam","busId":"v","sources":["v1"]}]]""");
+    Feed("""["bus_options",[{"id":"p","type":"program"},{"id":"v","type":"preview"}]]""");
+    Feed("""["device_sources",[{"id":"a1","deviceId":"cam","sourceId":"a"},{"id":"v1","deviceId":"cam","sourceId":"v"}]]""");
+    Check(cache.Build(1000) is null, "Missing source metadata must not publish tally");
+    Feed("""["sources",[{"id":"a","sourceTypeId":"44b8bc4f","connected":true},{"id":"v","sourceTypeId":"58b6af42","connected":true}]]""");
+    var state = cache.Build(1000)!;
+    Check(state.Devices.Single().Tally == 3 && state.Atem.Single().Tally == 3 && state.Vmix.Single().Tally == 2,
+        "Tally Arbiter must expose separate layers and program priority");
+    Feed("""["sources",[{"id":"a","sourceTypeId":"44b8bc4f","connected":false},{"id":"v","sourceTypeId":"58b6af42","connected":true}]]""");
+    state = cache.Build(1100)!;
+    Check(state.Atem.Single().Tally == 0 && state.Vmix.Single().Tally == 2 && state.Devices.Single().Tally == 2,
+        "A disconnected mixer must not promote stale Program");
+    Check(cache.Build(2501) is null, "Old snapshots must expire");
+    Console.WriteLine("PASS Tally Arbiter address parsing, snapshots, separate mixer layers and source health");
+}
+
+static async Task TestArbiterSocket(string endpoint)
+{
+    using var source = new TallyArbiterSource(TallyArbiterSource.Endpoint(endpoint) ??
+        throw new ArgumentException("Invalid Tally Arbiter test endpoint"));
+    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+    while (!source.State.Status.StartsWith("Verbunden", StringComparison.Ordinal))
+        await Task.Delay(100, timeout.Token);
+    Console.WriteLine("PASS real Tally Arbiter Engine.IO/Socket.IO connection and metadata polling");
 }
 
 static async Task TestVmix()

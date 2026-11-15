@@ -29,6 +29,7 @@ internal static class Program
 internal sealed class MainWindow : Form
 {
     private static readonly string[] States = ["Unbekannt", "Inaktiv", "Preview", "Program"];
+    private static readonly string ArbiterAddressFile = Path.Combine(PilotCore.DataDirectory, "arbiter-address.txt");
     private readonly PilotCore core;
     private readonly OperatorSession session;
     private readonly DataGridView devices = new()
@@ -50,6 +51,7 @@ internal sealed class MainWindow : Form
     private readonly TextBox next = new() { MaxLength = 38 };
     private readonly TextBox atemHost = new() { PlaceholderText = "ATEM-IP-Adresse" };
     private readonly TextBox vmixHost = new() { PlaceholderText = "vMix-IP oder Hostname" };
+    private readonly TextBox arbiterHost = new() { PlaceholderText = "Host oder Host:4455" };
     private readonly ComboBox insideSource = Choices();
     private readonly ComboBox outsideSource = Choices();
     private readonly ComboBox insideInput = Choices(editable: true);
@@ -58,7 +60,7 @@ internal sealed class MainWindow : Form
     private readonly ComboBox simulatedAtem = Choices();
     private readonly ComboBox simulatedVmix = Choices();
     private readonly NumericUpDown interval = new() { Minimum = 0.5m, Maximum = 60, Value = 3, Increment = 0.5m, DecimalPlaces = 1 };
-    private readonly Label atemStatus = Notice(), vmixStatus = Notice(), mappingStatus = Notice();
+    private readonly Label atemStatus = Notice(), vmixStatus = Notice(), arbiterStatus = Notice(), mappingStatus = Notice();
     private readonly Label usbStatus = Notice(), chatStatus = Notice(), simStatus = Notice();
     private readonly TabControl tabs = new() { Dock = DockStyle.Fill };
     private readonly TabPage overview = new("Regie");
@@ -68,7 +70,9 @@ internal sealed class MainWindow : Form
     private readonly System.Windows.Forms.Timer timer = new() { Interval = 25 };
     private AtemSource? atem;
     private VmixSource? vmix;
+    private TallyArbiterSource? arbiter;
     private MixerState lastAtem = MixerState.Off, lastVmix = MixerState.Off;
+    private ArbiterState lastArbiter = ArbiterState.Off;
     private string? mappingId;
     private long lastUi;
     private bool busy;
@@ -113,6 +117,7 @@ internal sealed class MainWindow : Form
         AddSources();
         AddSimulation();
         AddSetup();
+        LoadArbiterAddress();
         ScanPorts();
         foreach (string address in FindAddresses()) addresses.Items.Add(address);
         if (addresses.Items.Count > 0) addresses.SelectedIndex = 0;
@@ -130,6 +135,7 @@ internal sealed class MainWindow : Form
             timer.Dispose();
             atem?.Dispose();
             vmix?.Dispose();
+            arbiter?.Dispose();
         };
     }
 
@@ -137,27 +143,38 @@ internal sealed class MainWindow : Form
     {
         var grid = Grid(overview, "Chat und Next");
         Full(grid, new Label { AutoSize = true, Text = "Oben einen oder mehrere Sticks auswählen." });
-        Row(grid, "Chat", chat);
-        Row(grid, "Next", next);
-        Full(grid, Buttons(Action("Senden", (_, _) => SendChat(false)),
-            Action("Chat und Next leeren", (_, _) => SendChat(true))));
+        Row(grid, "Chat", chat, InlineButtons(Action("Leeren", (_, _) => SendText(true, false, clear: true)),
+            Action("Senden", (_, _) => SendText(true, false))));
+        Row(grid, "Next", next, InlineButtons(Action("Leeren", (_, _) => SendText(false, true, clear: true)),
+            Action("Senden", (_, _) => SendText(false, true))));
+        chat.KeyDown += (_, e) => SendOnEnter(e, chatField: true);
+        next.KeyDown += (_, e) => SendOnEnter(e, chatField: false);
+        Full(grid, Buttons(Action("Chat und Next senden", (_, _) => SendText(true, true)),
+            Action("Chat und Next leeren", (_, _) => SendText(true, true, clear: true))));
         Full(grid, chatStatus);
     }
 
     private void AddSources()
     {
-        var grid = Grid(sources, "Mixer verbinden");
+        var grid = Grid(sources, "Quellen verbinden");
         var connectAtem = Action("Verbinden");
         var connectVmix = Action("Verbinden");
+        var connectArbiter = Action("Verbinden");
         connectAtem.Click += (_, _) => ToggleAtem(connectAtem);
         connectVmix.Click += (_, _) => ToggleVmix(connectVmix);
+        connectArbiter.Click += (_, _) => ToggleArbiter(connectArbiter);
         Row(grid, "ATEM", atemHost, connectAtem);
         atemStatus.Text = MixerState.Off.Status;
         Full(grid, atemStatus);
         Row(grid, "vMix", vmixHost, connectVmix);
         vmixStatus.Text = MixerState.Off.Status;
         Full(grid, vmixStatus);
-        foreach (var box in new[] { insideSource, outsideSource }) box.Items.AddRange(["Aus", "ATEM", "vMix"]);
+        Row(grid, "Tally Arbiter", arbiterHost, connectArbiter);
+        arbiterStatus.Text = ArbiterState.Off.Status;
+        Full(grid, arbiterStatus);
+        foreach (var box in new[] { insideSource, outsideSource })
+            box.Items.AddRange(["Aus · ausblenden", "ATEM", "vMix", "Tally Arbiter · Gerät",
+                "Tally Arbiter · ATEM", "Tally Arbiter · vMix"]);
         insideSource.SelectionChangeCommitted += (_, _) => ChangeMixer(insideSource, insideInput);
         outsideSource.SelectionChangeCommitted += (_, _) => ChangeMixer(outsideSource, outsideInput);
         Row(grid, "Innen · Quelle", insideSource);
@@ -296,6 +313,33 @@ internal sealed class MainWindow : Form
         vmixStatus.Text = vmix?.State.Status ?? MixerState.Off.Status;
     }
 
+    private void ToggleArbiter(Button button)
+    {
+        if (arbiter is not null) { arbiter.Dispose(); arbiter = null; }
+        else if (TallyArbiterSource.Endpoint(arbiterHost.Text) is { } endpoint)
+        {
+            arbiter = new TallyArbiterSource(endpoint);
+            try
+            {
+                Directory.CreateDirectory(PilotCore.DataDirectory);
+                File.WriteAllText(ArbiterAddressFile, arbiterHost.Text.Trim());
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException) { }
+        }
+        else { arbiterStatus.Text = "Bitte Host, Host:Port oder eine HTTP-/HTTPS-Adresse eingeben."; return; }
+        button.Text = arbiter is null ? "Verbinden" : "Trennen";
+        arbiterStatus.Text = arbiter?.State.Status ?? ArbiterState.Off.Status;
+    }
+
+    private void LoadArbiterAddress()
+    {
+        try
+        {
+            if (File.Exists(ArbiterAddressFile)) arbiterHost.Text = File.ReadAllText(ArbiterAddressFile);
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException) { }
+    }
+
     private string[] SelectedIds() => devices.SelectedRows.Cast<DataGridViewRow>()
         .Select(row => row.Tag).OfType<string>().ToArray();
 
@@ -324,6 +368,7 @@ internal sealed class MainWindow : Form
     private void ShowMapping(ComboBox source, ComboBox input, Assignment mapping)
     {
         source.SelectedIndex = (int)mapping.Mixer;
+        input.Tag = null;
         UpdateInputs(source, input);
         var entry = input.Items.OfType<MixerInput>().FirstOrDefault(value =>
             mapping.Key is null ? value.Number == mapping.Input :
@@ -332,12 +377,16 @@ internal sealed class MainWindow : Form
         else
         {
             input.SelectedIndex = -1;
-            input.Text = mapping.Key is null ? mapping.Input.ToString() : $"Gespeicherter Eingang {mapping.Input}";
+            string value = mapping.Mixer == MixerKind.Off ? "" : mapping.Key is null ?
+                mapping.Input.ToString() : $"Gespeicherter Eingang {mapping.Input}";
+            input.Text = value;
+            if (mapping.Key is not null) input.Tag = (Mapping: mapping, Text: value);
         }
     }
 
     private void ChangeMixer(ComboBox source, ComboBox input)
     {
+        input.Tag = null;
         input.SelectedIndex = -1;
         input.Text = "";
         UpdateInputs(source, input);
@@ -349,9 +398,14 @@ internal sealed class MainWindow : Form
         string oldText = input.Text;
         input.Items.Clear();
         input.Enabled = source.SelectedIndex > 0;
-        var state = source.SelectedIndex == 1 ? lastAtem : source.SelectedIndex == 2 ? lastVmix : MixerState.Off;
-        input.Items.AddRange(state.Inputs);
-        var match = state.Inputs.FirstOrDefault(value => previous is not null &&
+        var entries = (MixerKind)source.SelectedIndex switch
+        {
+            MixerKind.Atem => lastAtem.Inputs,
+            MixerKind.Vmix => lastVmix.Inputs,
+            var mixer => lastArbiter.For(mixer)
+        };
+        input.Items.AddRange(entries);
+        var match = entries.FirstOrDefault(value => previous is not null &&
             (previous.Key is null ? value.Number == previous.Number : value.Key == previous.Key));
         if (match is not null) input.SelectedItem = match;
         else input.Text = oldText;
@@ -362,6 +416,9 @@ internal sealed class MainWindow : Form
         var mixer = (MixerKind)Math.Max(0, source.SelectedIndex);
         if (mixer == MixerKind.Off) return new(mixer, 0);
         if (input.SelectedItem is MixerInput item) return new(mixer, item.Number, item.Key);
+        if (input.Tag is ValueTuple<Assignment, string> retained && retained.Item1.Mixer == mixer &&
+            input.Text == retained.Item2) return retained.Item1;
+        if (mixer is MixerKind.Arbiter or MixerKind.ArbiterAtem or MixerKind.ArbiterVmix) return null;
         if (!int.TryParse(input.Text, out int number) ||
             (mixer == MixerKind.Vmix ? number is < 1 or > 1000 : number is < 0 or > 65535)) return null;
         var listed = input.Items.OfType<MixerInput>().FirstOrDefault(value => value.Number == number);
@@ -403,22 +460,31 @@ internal sealed class MainWindow : Form
         catch (IOException error) { mappingStatus.Text = error.Message; }
     }
 
-    private void SendChat(bool clear)
+    private void SendOnEnter(KeyEventArgs e, bool chatField)
+    {
+        if (e.KeyCode != Keys.Enter || e.Modifiers != Keys.None) return;
+        e.SuppressKeyPress = true;
+        SendText(chatField, !chatField);
+    }
+
+    private void SendText(bool updateChat, bool updateNext, bool clear = false)
     {
         var ids = SelectedIds();
         if (ids.Length == 0) { chatStatus.Text = "Bitte mindestens einen Stick auswählen."; return; }
-        string message = clear ? "" : chat.Text.Trim();
-        string upcoming = clear ? "" : next.Text.Trim();
-        if (Encoding.UTF8.GetByteCount(message) > 160 || Encoding.UTF8.GetByteCount(upcoming) > 80 ||
-            message.Any(char.IsControl) || upcoming.Any(char.IsControl))
+        string? message = updateChat ? clear ? "" : chat.Text.Trim() : null;
+        string? upcoming = updateNext ? clear ? "" : next.Text.Trim() : null;
+        static bool Invalid(string? value, int limit) =>
+            value is not null && (Encoding.UTF8.GetByteCount(value) > limit || value.Any(char.IsControl));
+        if (Invalid(message, 160) || Invalid(upcoming, 80))
         {
             chatStatus.Text = "Bitte Chat oder Next kürzen und Steuerzeichen entfernen.";
             return;
         }
         session.SetText(ids, message, upcoming);
-        if (clear) { chat.Clear(); next.Clear(); }
-        chatStatus.Text = clear ? $"Chat und Next für {ids.Length} Stick(s) geleert." :
-            $"Chat und Next für {ids.Length} Stick(s) gesetzt. Die Tabelle zeigt die Empfangsbestätigung.";
+        if (clear && updateChat) chat.Clear();
+        if (clear && updateNext) next.Clear();
+        string fields = updateChat && updateNext ? "Chat und Next" : updateChat ? "Chat" : "Next";
+        chatStatus.Text = $"{fields} für {ids.Length} Stick(s) {(clear ? "geleert" : "gesendet")}.";
     }
 
     private void Simulate()
@@ -442,25 +508,30 @@ internal sealed class MainWindow : Form
         {
             var a = atem?.State ?? MixerState.Off;
             var v = vmix?.State ?? MixerState.Off;
+            var ta = arbiter?.State ?? ArbiterState.Off;
             long now = Environment.TickCount64;
-            session.Update(a, v, now);
+            session.Update(a, v, now, ta);
             core.Tick();
             if (now - lastUi < 250) return;
             lastUi = now;
-            UpdateMixerUi(a, v);
+            UpdateMixerUi(a, v, ta);
             RefreshRows();
         }
         catch (SocketException) { chatStatus.Text = "Netzwerkfehler. Bitte LAN und UDP-Port 46224 prüfen."; }
     }
 
-    private void UpdateMixerUi(MixerState a, MixerState v)
+    private void UpdateMixerUi(MixerState a, MixerState v, ArbiterState ta)
     {
-        if (ReferenceEquals(a, lastAtem) && ReferenceEquals(v, lastVmix)) return;
+        if (ReferenceEquals(a, lastAtem) && ReferenceEquals(v, lastVmix) && ReferenceEquals(ta, lastArbiter)) return;
         if (!ReferenceEquals(a, lastAtem)) atemStatus.Text = a.Status;
         if (!ReferenceEquals(v, lastVmix)) vmixStatus.Text = v.Status;
-        bool listChanged = !SameInputs(a, lastAtem) || !SameInputs(v, lastVmix);
+        if (!ReferenceEquals(ta, lastArbiter)) arbiterStatus.Text = ta.Status;
+        bool listChanged = !SameInputs(a.Inputs, lastAtem.Inputs) || !SameInputs(v.Inputs, lastVmix.Inputs) ||
+            !SameInputs(ta.Devices, lastArbiter.Devices) || !SameInputs(ta.Atem, lastArbiter.Atem) ||
+            !SameInputs(ta.Vmix, lastArbiter.Vmix);
         lastAtem = a;
         lastVmix = v;
+        lastArbiter = ta;
         if (listChanged && mappingId is { } id)
         {
             var pager = core.Devices.First(device => device.Id == id);
@@ -471,9 +542,9 @@ internal sealed class MainWindow : Form
         }
     }
 
-    private static bool SameInputs(MixerState first, MixerState second) =>
-        first.Inputs.Select(input => (input.Number, input.Name, input.Key))
-            .SequenceEqual(second.Inputs.Select(input => (input.Number, input.Name, input.Key)));
+    private static bool SameInputs(MixerInput[] first, MixerInput[] second) =>
+        first.Select(input => (input.Number, input.Name, input.Key))
+            .SequenceEqual(second.Select(input => (input.Number, input.Name, input.Key)));
 
     private void RefreshRows()
     {
@@ -490,7 +561,8 @@ internal sealed class MainWindow : Form
                 Connection.Connected => "Verbunden", Connection.Delayed => "Delayed", _ => "Getrennt"
             };
             string[] values = [status.Name, session.IsTesting(status.Id) ? "Simulation" : "Mixer",
-                status.Online ? States[status.View.Inside] : "—", status.Online ? States[status.View.Outside] : "—",
+                LayerStatus(status.Online, status.View.Inside, status.View.InsideSource),
+                LayerStatus(status.Online, status.View.Outside, status.View.OutsideSource),
                 connection, status.Rssi is int rssi ? $"{WifiBars(rssi)}/4 · {rssi} dBm" : "—",
                 status.Rtt is int rtt ? $"{rtt} ms" : "—", status.Online && status.Battery is int battery ? $"{battery} %" : "—",
                 status.PreviewReceived ? "Bestätigt" : "—"];
@@ -502,6 +574,9 @@ internal sealed class MainWindow : Form
             };
         }
     }
+
+    private static string LayerStatus(bool online, int state, string source) =>
+        source == "off" ? "Aus" : online ? States[state] : "—";
 
     private static int WifiBars(int rssi) => rssi switch { >= -55 => 4, >= -67 => 3, >= -75 => 2, >= -82 => 1, _ => 0 };
 
@@ -541,6 +616,13 @@ internal sealed class MainWindow : Form
         return panel;
     }
 
+    private static FlowLayoutPanel InlineButtons(params Button[] buttons)
+    {
+        var panel = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = false };
+        panel.Controls.AddRange(buttons);
+        return panel;
+    }
+
     private static TableLayoutPanel Grid(TabPage page, string title)
     {
         var grid = new TableLayoutPanel
@@ -565,7 +647,7 @@ internal sealed class MainWindow : Form
         grid.SetColumnSpan(control, 3);
     }
 
-    private static void Row(TableLayoutPanel grid, string name, Control control, Button? action = null)
+    private static void Row(TableLayoutPanel grid, string name, Control control, Control? action = null)
     {
         int row = grid.RowCount++;
         grid.RowStyles.Add(new RowStyle(SizeType.AutoSize));

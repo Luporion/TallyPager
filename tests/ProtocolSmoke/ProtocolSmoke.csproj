@@ -9,6 +9,7 @@
     <Compile Include="../../desktop/PilotCore.cs" Link="PilotCore.cs" />
     <Compile Include="../../desktop/OperatorSession.cs" Link="OperatorSession.cs" />
     <Compile Include="../../desktop/Mixers.cs" Link="Mixers.cs" />
+    <Compile Include="../../desktop/TallyArbiterSource.cs" Link="TallyArbiterSource.cs" />
     <Compile Include="../../desktop/PagerUsb.cs" Link="PagerUsb.cs" />
     <PackageReference Include="LibAtem" Version="1.0.0" />
     <PackageReference Include="log4net" Version="3.6.0" />

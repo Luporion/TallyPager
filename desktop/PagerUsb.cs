@@ -13,7 +13,7 @@ internal sealed record UsbStatus(string Version, string Id, bool Configured, boo
 
 internal static class PagerUsb
 {
-    public const string Version = "0.3.0";
+    public const string Version = "0.4.0";
     public const string FirmwareFileName = "TallyPager-Firmware-M5StickC-Plus2-" + Version + ".zip";
     private const string StatusPrefix = "TP ";
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
