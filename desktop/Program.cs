@@ -147,8 +147,6 @@ internal sealed class MainWindow : Form
             Action("Senden", (_, _) => SendText(true, false))));
         Row(grid, "Next", next, InlineButtons(Action("Leeren", (_, _) => SendText(false, true, clear: true)),
             Action("Senden", (_, _) => SendText(false, true))));
-        chat.KeyDown += (_, e) => SendOnEnter(e, chatField: true);
-        next.KeyDown += (_, e) => SendOnEnter(e, chatField: false);
         Full(grid, Buttons(Action("Chat und Next senden", (_, _) => SendText(true, true)),
             Action("Chat und Next leeren", (_, _) => SendText(true, true, clear: true))));
         Full(grid, chatStatus);
@@ -460,11 +458,14 @@ internal sealed class MainWindow : Form
         catch (IOException error) { mappingStatus.Text = error.Message; }
     }
 
-    private void SendOnEnter(KeyEventArgs e, bool chatField)
+    protected override bool ProcessCmdKey(ref Message message, Keys keyData)
     {
-        if (e.KeyCode != Keys.Enter || e.Modifiers != Keys.None) return;
-        e.SuppressKeyPress = true;
-        SendText(chatField, !chatField);
+        if (keyData == Keys.Enter && tabs.SelectedTab == overview && (chat.Focused || next.Focused))
+        {
+            SendText(chat.Focused, next.Focused);
+            return true;
+        }
+        return base.ProcessCmdKey(ref message, keyData);
     }
 
     private void SendText(bool updateChat, bool updateNext, bool clear = false)
