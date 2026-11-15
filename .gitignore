@@ -1,0 +1,12 @@
+/TallyArbiter/
+/CameraCue-*-source.zip
+/TallyPager_Design.xlsx
+node_modules/
+dist/
+/desktop/bin/
+/desktop/obj/
+/tests/**/bin/
+/tests/**/obj/
+.env
+.env.*
+!.env.example
