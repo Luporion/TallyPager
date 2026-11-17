@@ -9,11 +9,16 @@ using System.Text.Json;
 namespace TallyPager;
 
 internal sealed record UsbStatus(string Version, string Id, bool Configured, bool Wifi, string Ip,
-    bool Core, int Inside, int Outside, string Cue, string Next);
+    bool Core, int Inside, int Outside, string Cue, string Next, string Mode = "udp",
+    bool BaseRole = false, string RadioAddress = "", int Channel = 6, bool RadioReady = false,
+    string[]? Features = null)
+{
+    public FirmwareInfo? Firmware => FirmwareInfo.Read(Version, Features);
+}
 
 internal static class PagerUsb
 {
-    public const string Version = "0.4.0";
+    public const string Version = "0.6.3";
     public const string FirmwareFileName = "TallyPager-Firmware-M5StickC-Plus2-" + Version + ".zip";
     private const string StatusPrefix = "TP ";
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
@@ -24,7 +29,7 @@ internal static class PagerUsb
         return ReadStatus(serial, timeout);
     }
 
-    private static UsbStatus ReadStatus(SerialPort serial, TimeSpan timeout)
+    internal static UsbStatus ReadStatus(SerialPort serial, TimeSpan timeout)
     {
         var timer = Stopwatch.StartNew();
         while (timer.Elapsed < timeout)
@@ -33,29 +38,80 @@ internal static class PagerUsb
             var reply = ReadReply(serial, TimeSpan.FromMilliseconds(420));
             if (reply?.StartsWith("TP {", StringComparison.Ordinal) == true)
             {
-                var status = JsonSerializer.Deserialize<UsbStatus>(reply[StatusPrefix.Length..], Json);
-                if (status is { Id.Length: 12 } &&
-                    status.Id.All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f')) return status;
+                if (ParseStatus(reply) is { } status) return status;
             }
             Thread.Sleep(120);
         }
         throw new TimeoutException("Die TallyPager-Firmware antwortet nicht am ausgewählten USB-Port.");
     }
 
-    public static UsbStatus Configure(string port, Pager pager, string host, string ssid, string password)
+    internal static UsbStatus? ParseStatus(string line)
+    {
+        if (line.Length > 8192 || !line.StartsWith("TP {", StringComparison.Ordinal)) return null;
+        try
+        {
+            var status = JsonSerializer.Deserialize<UsbStatus>(line[StatusPrefix.Length..], Json);
+            return status is { Id.Length: 12, Firmware: not null } &&
+                status.Id.All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f') ? status : null;
+        }
+        catch (JsonException) { return null; }
+    }
+
+    public static UsbStatus Configure(string port, Pager pager, string host, string ssid, string password,
+        string mode = "udp", string gateway = "", int channel = 6)
     {
         using (var serial = Open(port))
         {
             var current = ReadStatus(serial, TimeSpan.FromSeconds(4));
             if (current.Id != pager.Id) throw new InvalidOperationException("Am USB-Port antwortet inzwischen ein anderer Stick.");
-            serial.WriteLine("TP CONFIG " + JsonSerializer.Serialize(new { host, pager.Name, ssid, password, pager.Key }, Json));
+            serial.WriteLine(ConfigCommand(current, pager, host, ssid, password, mode, gateway, channel));
             if (ReadReply(serial, TimeSpan.FromSeconds(4)) != "TP OK")
                 throw new InvalidOperationException("Der Stick hat die Einstellungen nicht bestätigt.");
         }
         Thread.Sleep(1400);
         var status = ReadStatus(port, TimeSpan.FromSeconds(8));
-        return status is { Configured: true } && status.Id == pager.Id ? status :
+        return status is { Configured: true, BaseRole: false } && status.Id == pager.Id && status.Mode == mode ? status :
             throw new InvalidOperationException("Die Konfiguration konnte nach dem Neustart nicht bestätigt werden.");
+    }
+
+    internal static string ConfigCommand(UsbStatus current, Pager pager, string host, string ssid, string password,
+        string mode, string gateway, int channel)
+    {
+        var firmware = current.Firmware;
+        if (firmware?.AllowsUsbMode(mode) != true || current.BaseRole && !firmware.Supports(FirmwareInfo.RadioBase))
+            throw new InvalidOperationException($"Firmware {current.Version} unterstützt die gewählte USB-Einrichtung nicht.");
+        object payload = firmware.Supports(FirmwareInfo.RadioBase) || mode != "udp" ?
+            new { host, pager.Name, ssid, password, pager.Key, mode, gateway, channel } :
+            new { host, pager.Name, ssid, password, pager.Key };
+        return "TP CONFIG " + JsonSerializer.Serialize(payload, Json);
+    }
+
+    public static UsbStatus ConfigureBase(string port, string id, string mode, int channel)
+    {
+        return SetRole(port, id, status => status.Firmware?.AllowsBase(mode) == true,
+            "TP BASE " + JsonSerializer.Serialize(new { mode, channel }, Json),
+            status => status.BaseRole && status.RadioReady && status.Mode == mode && status.Channel == channel);
+    }
+
+    public static UsbStatus RestorePager(string port, string id) =>
+        SetRole(port, id, status => status.BaseRole && status.Firmware?.Supports(FirmwareInfo.RadioBase) == true,
+            "TP PAGER", status => status.Configured && !status.BaseRole);
+
+    private static UsbStatus SetRole(string port, string id, Func<UsbStatus, bool> supports, string command, Func<UsbStatus, bool> ready)
+    {
+        using (var serial = Open(port))
+        {
+            var current = ReadStatus(serial, TimeSpan.FromSeconds(4));
+            if (current.Id != id || !supports(current))
+                throw new InvalidOperationException("Der Stick am USB-Port unterstützt diese Rollenänderung nicht.");
+            serial.WriteLine(command);
+            if (ReadReply(serial, TimeSpan.FromSeconds(4)) != "TP OK")
+                throw new InvalidOperationException("Der Stick hat die Rolle nicht bestätigt.");
+        }
+        Thread.Sleep(1400);
+        var status = ReadStatus(port, TimeSpan.FromSeconds(8));
+        return status.Id == id && ready(status) ? status :
+            throw new InvalidOperationException("Die gewünschte Rolle ist am Stick nicht betriebsbereit.");
     }
 
     internal static readonly (string Offset, string Name, long Limit)[] Images =
@@ -93,7 +149,7 @@ internal static class PagerUsb
             });
     }
 
-    internal static void LoadFirmware(string path, string directory)
+    internal static void LoadFirmware(string path, string? directory, string expectedVersion = Version)
     {
         using var zip = ZipFile.OpenRead(path);
         var manifestEntry = zip.GetEntry("manifest.json");
@@ -101,8 +157,8 @@ internal static class PagerUsb
             throw new InvalidDataException("Im Firmwarepaket fehlt das Manifest.");
         using var manifestStream = manifestEntry.Open();
         var manifest = JsonSerializer.Deserialize<FirmwareManifest>(manifestStream, Json);
-        if (manifest is not { Board: "m5stick-cplus2", Version: Version, Sha256: not null })
-            throw new InvalidDataException($"Bitte das M5StickC-Plus2-Firmwarepaket für TallyPager {Version} auswählen.");
+        if (manifest is not { Board: "m5stick-cplus2", Sha256: not null } || manifest.Version != expectedVersion)
+            throw new InvalidDataException($"Bitte das M5StickC-Plus2-Firmwarepaket für TallyPager {expectedVersion} auswählen.");
 
         foreach (var image in Images)
         {
@@ -117,7 +173,7 @@ internal static class PagerUsb
             if (stream.ReadByte() != -1 ||
                 !Convert.ToHexString(SHA256.HashData(bytes)).Equals(expected, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidDataException("Firmware-Prüfsumme stimmt nicht: " + image.Name);
-            File.WriteAllBytes(Path.Combine(directory, image.Name), bytes);
+            if (directory is not null) File.WriteAllBytes(Path.Combine(directory, image.Name), bytes);
         }
     }
 
@@ -177,7 +233,7 @@ internal static class PagerUsb
         File.Move(temporary, path, overwrite: true);
     }
 
-    private static SerialPort Open(string port)
+    internal static SerialPort Open(string port)
     {
         var serial = new SerialPort(port, 115200) { Encoding = Encoding.UTF8, ReadTimeout = 150, WriteTimeout = 1000 };
         try
@@ -197,7 +253,8 @@ internal static class PagerUsb
             try
             {
                 string line = port.ReadLine().Trim();
-                if (line.StartsWith(StatusPrefix, StringComparison.Ordinal)) return line;
+                if (line.StartsWith(StatusPrefix, StringComparison.Ordinal) &&
+                    !line.StartsWith("TP LINK ", StringComparison.Ordinal)) return line;
             }
             catch (TimeoutException) { }
         }

@@ -1,16 +1,27 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFramework>net10.0-windows</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
   </PropertyGroup>
   <ItemGroup>
+    <FrameworkReference Include="Microsoft.WindowsDesktop.App" />
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <Compile Include="../../desktop/LocalSecret.cs" Link="LocalSecret.cs" />
+    <Compile Include="../../desktop/Profiles.cs" Link="Profiles.cs" />
+    <Compile Include="../../desktop/RadioBridge.cs" Link="RadioBridge.cs" />
+    <Compile Include="../../desktop/WifiManagement.cs" Link="WifiManagement.cs" />
+    <Compile Include="../../desktop/DiagnosticLog.cs" Link="DiagnosticLog.cs" />
+    <Compile Include="../../desktop/GitHubUpdates.cs" Link="GitHubUpdates.cs" />
+    <Compile Include="../../desktop/RegieCheck.cs" Link="RegieCheck.cs" />
+    <Compile Include="../../desktop/CompanionApi.cs" Link="CompanionApi.cs" />
     <Compile Include="../../desktop/PilotCore.cs" Link="PilotCore.cs" />
     <Compile Include="../../desktop/OperatorSession.cs" Link="OperatorSession.cs" />
     <Compile Include="../../desktop/Mixers.cs" Link="Mixers.cs" />
     <Compile Include="../../desktop/TallyArbiterSource.cs" Link="TallyArbiterSource.cs" />
     <Compile Include="../../desktop/PagerUsb.cs" Link="PagerUsb.cs" />
+    <Compile Include="../../desktop/FirmwareInfo.cs" Link="FirmwareInfo.cs" />
     <PackageReference Include="LibAtem" Version="1.0.0" />
     <PackageReference Include="log4net" Version="3.6.0" />
     <PackageReference Include="System.IO.Ports" Version="10.0.9" />

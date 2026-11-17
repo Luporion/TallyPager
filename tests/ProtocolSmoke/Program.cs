@@ -1,8 +1,10 @@
 using System.Diagnostics;
 using System.Net;
+using System.Net.Http.Headers;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using TallyPager;
 
 const string id = "123456789abc";
@@ -14,14 +16,15 @@ if (args is ["--arbiter", var serverAddress])
 string settings = Directory.CreateTempSubdirectory("tallypager-smoke-").FullName;
 try
 {
-    string key;
+    string key = PilotCore.RandomHex(32);
     string firstSession;
+    string deviceConfiguration = Path.Combine(settings, "devices.json");
+    File.WriteAllText(deviceConfiguration, JsonSerializer.Serialize(new[] { new Pager(id, "Test", key) }));
     using var stick = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
     using (var core = new PilotCore(settings, port: 0))
     {
-        var pager = core.Prepare(id, "Test");
-        core.Save(pager);
-        key = pager.Key;
+        Check(core.Prepare(id, "Test").Key == key && !File.ReadAllText(deviceConfiguration).Contains(key),
+            "Legacy paired key must survive DPAPI migration");
 
         Send(stick, core, $"TP1|hello|{id}|{new string('c', 32)}", new string('0', 64));
         core.Tick();
@@ -66,9 +69,19 @@ try
         Check(restarted.Statuses().Single().Battery is null, "Old-session telemetry must be ignored");
     }
     Console.WriteLine("PASS UDP pairing, invalid signature, independent tally, Cue/Next, lost snapshot, clear and Core restart");
+    TestAcknowledgements(settings);
+    TestFirmwareCompatibility(settings);
+    TestRadioBridge(settings);
+    await TestWifiManagement(settings);
+    await TestWifiDiscovery(settings);
     TestAssignments(settings);
+    TestRegieCheck(settings);
+    await TestDiagnosticStorage(settings);
+    TestProfiles(settings);
+    await TestCompanion();
     TestArbiter();
     await TestVmix();
+    await TestVmixFailure();
     using (var atem = new AtemSource("127.0.0.1"))
         Check(atem.State.Inputs.Length == 0, "An ATEM without a source must remain unknown");
     if (args.Length > 0)
@@ -80,12 +93,12 @@ try
             File.Delete(Path.Combine(settings, image.Name));
         }
         Console.WriteLine("PASS separate firmware package and image checksums");
+        await TestGitHubUpdate(settings, Path.GetFullPath(args[0]));
     }
 }
 finally
 {
-    foreach (var name in new[] { "devices.json", "devices.json.tmp" })
-        File.Delete(Path.Combine(settings, name));
+    foreach (string file in Directory.EnumerateFiles(settings)) File.Delete(file);
     Directory.Delete(settings);
 }
 
@@ -145,17 +158,18 @@ static void TestAssignments(string settings)
     var session = new OperatorSession(core);
     session.SetText([left.Id], "Test", "Next");
     session.Update(atem, vmix, 1000);
-    Check(core.Statuses().First(s => s.Id == left.Id).View == new Preview(2, 3, "Test", "Next", false, "vMix", "ATEM"),
+    Preview Left() => core.Statuses().First(s => s.Id == left.Id).View with { ChatId = "" };
+    Check(Left() == new Preview(2, 3, "Test", "Next", false, "vMix", "ATEM"),
         "vMix GUID follows renumbering, inside/outside must be reversible");
     Check(core.Statuses().First(s => s.Id == right.Id).View == new Preview(3, 0, "", "", false, "ATEM", "vMix"),
         "Chat and mappings must stay isolated per stick");
     session.Start([left.Id], new(Scenario.VmixOnOff, 500, 2, 0, 1000));
     session.Update(atem, vmix, 1500);
-    Check(core.Statuses().First(s => s.Id == left.Id).View == new Preview(1, 2, "Test", "Next", true, "vMix", "ATEM"),
+    Check(Left() == new Preview(1, 2, "Test", "Next", true, "vMix", "ATEM"),
         "Interval simulation must follow the swapped display assignment");
     session.Stop([left.Id]);
     session.Update(atem, MixerState.Off, 2000);
-    Check(core.Statuses().First(s => s.Id == left.Id).View == new Preview(0, 3, "Test", "Next", false, "vMix", "ATEM"),
+    Check(Left() == new Preview(0, 3, "Test", "Next", false, "vMix", "ATEM"),
         "vMix loss must only affect the vMix layer");
     core.Save(left with { Inside = new(MixerKind.Off, 0) });
     session.SetText([right.Id], "Other", "Next B");
@@ -168,6 +182,459 @@ static void TestAssignments(string settings)
     session.SetText([right.Id], null, "");
     Check(session.Text(right.Id) == ("Chat only", ""), "Clearing Next must preserve Chat");
     Console.WriteLine("PASS separate devices, stable mapping, swapped layers and per-device interval simulation");
+}
+
+static void TestFirmwareCompatibility(string settings)
+{
+    const string mac = "10061c286f4c";
+    var legacyBase = PagerUsb.ParseStatus($$"""TP {"id":"{{id}}","version":"0.6.0","baseRole":true,"radioReady":true,"mode":"ble","radioAddress":"{{mac}}"}""");
+    var early = PagerUsb.ParseStatus($$"""TP {"id":"{{id}}","version":"0.4.0","configured":true}""");
+    var future = PagerUsb.ParseStatus($$"""TP {"id":"{{id}}","version":"0.9.1","features":["usb-config","radio-base","ble","screen-colors-v2"],"configured":true,"baseRole":true,"radioReady":true,"mode":"ble","futureObject":{"other":2} }""");
+    Check(legacyBase?.Firmware is { Older: true, Advertised: false } && RadioBridge.CanConnect(legacyBase),
+        "0.6.0 USB radio base must remain compatible without an update");
+    Check(early?.Firmware is { Older: true } && early.Firmware.Missing.Contains("WLAN-Einstellungen") &&
+        !early.Firmware.AllowsUsbMode("ble"), "Legacy firmware must show actual missing features");
+    Check(future?.Firmware is { Newer: true, Advertised: true } && RadioBridge.CanConnect(future) &&
+        future.Firmware.Unknown.SequenceEqual(new[] { "screen-colors-v2" }) &&
+        future.Firmware.Missing.Contains("Chat quittieren"), "New USB versions must retain known features and list new feature IDs");
+    Check(!RadioBridge.CanConnect(future! with { Mode = "future-radio" }), "Unknown radio mode must not be started");
+    var pager = new Pager(id, "Gerät", PilotCore.RandomHex(32));
+    string command = PagerUsb.ConfigCommand(early!, pager, "192.168.1.1", "", "", "udp", "", 6);
+    Check(!command.Contains("\"mode\""), "Old USB config must keep its original command shape");
+    string modernCommand = PagerUsb.ConfigCommand(legacyBase!, pager, "192.168.1.1", "", "", "udp", "", 6);
+    Check(modernCommand.Contains("\"mode\":\"udp\""), "Provisioning a 0.6.0 base must restore the correct pager mode");
+    try { PagerUsb.ConfigCommand(early!, pager, "", "", "", "ble", "", 6); throw new Exception("Unsupported USB mode accepted"); }
+    catch (InvalidOperationException) { }
+
+    using var core = new PilotCore(settings, port: 0);
+    using var stick = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+    string key = core.Devices.Single().Key;
+    string session = Connect(stick, core, key, new string('e', 32));
+    void SendReport(string body)
+    {
+        Send(stick, core, body, Tag(body, key));
+        core.Tick();
+    }
+    SendReport($"TP1|link|{id}|{session}|1|82|-48|12|10|1");
+    SendReport($"TP1|cfg_info|{id}|{session}|0.6.0|192.168.1.2|5061676572|||idle");
+    Check(core.Statuses().Single() is { Firmware.VersionText: "0.6.0", Settings: not null, CanAck: true },
+        "Unmodified 0.6.0 WLAN telemetry must provide a version and preserve WLAN management");
+    SendReport($"TP1|firmware|{id}|{new string('f', 32)}|0.9.1|screen-colors-v2");
+    Check(core.Statuses().Single().Firmware?.VersionText == "0.6.0", "Old session provided a firmware capability list");
+    SendReport($"TP1|firmware|{id}|{session}|0.9.1|usb-config,link-stats,screen-colors-v2");
+    SendReport($"TP1|cfg_info|{id}|{session}|0.9.1|192.168.1.2|5061676572|||idle");
+    SendReport($"TP1|caps|{id}|{session}|ack");
+    var report = core.Statuses().Single();
+    Check(report.Firmware is { VersionText: "0.9.1", Advertised: true } &&
+        report.Firmware.Unknown.SequenceEqual(new[] { "screen-colors-v2" }) && report.Settings is null && !report.CanAck,
+        "Explicit firmware capabilities must win over older telemetry and control optional actions");
+    core.SetPreview(id, new Preview(3, 1, "Text", "", ChatId: PilotCore.RandomHex(16), RequireAck: true));
+    string[] state;
+    do { state = Read(stick, core, key); } while (state.Length < 14);
+    Check(state[5] == "3" && state[7] == "54657874" && state[13] == "0", "Known core behavior must remain usable without optional ACK");
+    Console.WriteLine("PASS version-independent USB setup and base, legacy WLAN version, authenticated future features and optional action gating");
+}
+
+static void TestRegieCheck(string settings)
+{
+    using var core = new PilotCore(settings, port: 0);
+    var pagers = core.Devices;
+    core.Save(pagers[0] with { ConfiguredTransport = "espnow-lr" });
+    var offline = core.Statuses().First(p => p.Id == pagers[0].Id);
+    Check(offline.Transport == "espnow-lr", "The check needs to know the configured radio even if the pager is offline");
+    var connected = core.Statuses().First(p => p.Id == pagers[1].Id) with
+    {
+        Connection = Connection.Connected, Rtt = 25, Firmware = FirmwareInfo.Read("0.6.0")
+    };
+    var assignments = new CameraRole(Guid.NewGuid(), "Mobile Kamera", new(MixerKind.Vmix, 1, "feed"),
+        new(MixerKind.Off, 0));
+    var missing = new CameraRole(Guid.NewGuid(), "Zweite Kamera", new(MixerKind.Atem, 5), new(MixerKind.Off, 0));
+    var unbound = new CameraRole(Guid.NewGuid(), "Reserve", new(MixerKind.Off, 0), new(MixerKind.Off, 0));
+    var profile = new RegieProfile(Guid.NewGuid(), "Probe", new("192.168.0.20", "192.168.0.30"),
+        [assignments, missing, unbound], [], []);
+    var bindings = new Dictionary<Guid, string> { [assignments.Id] = connected.Id, [missing.Id] = offline.Id };
+    var vmix = new MixerState("Verbunden", [new(8, "ATEM Feed", 2, "FEED"), new(1, "Fremder Eingang", 3, "other")]);
+    var checks = RegieCheck.Run(profile, bindings, [offline, connected], MixerState.Off, vmix, ArbiterState.Off, "espnow");
+    Check(checks.Any(row => row is { Target: "ATEM", Result: CheckResult.Problem }) &&
+        checks.Any(row => row.Target == "Mobile Kamera · Innen" && row.Result == CheckResult.Ready && row.Detail.Contains("ATEM Feed")) &&
+        checks.Any(row => row is { Target: "USB-Funkbasis", Result: CheckResult.Problem }) &&
+        checks.Any(row => row is { Target: "Reserve", Result: CheckResult.Problem }) &&
+        checks.Any(row => row is { Target: "Zweite Kamera · Firmware", Result: CheckResult.Warning }),
+        "Regiecheck missed a source, actual configured input, mismatched base, unbound pager or missing firmware");
+    Check(!checks.Any(row => row.Target == "Tally Arbiter") &&
+        !checks.Any(row => row.Target == "Mobile Kamera · Außen"), "Unused Arbiter and disabled display layer should not block readiness");
+    var changedCatalog = vmix with { Inputs = [new(1, "Fremder Eingang", 3, "other")] };
+    var changedChecks = RegieCheck.Run(profile, bindings, [offline, connected], MixerState.Off, changedCatalog,
+        ArbiterState.Off, "espnow-lr");
+    Check(changedChecks.Any(row => row is { Target: "Mobile Kamera · Innen", Result: CheckResult.Problem }) &&
+        changedChecks.Any(row => row is { Target: "USB-Funkbasis", Result: CheckResult.Ready }),
+        "A changed vMix catalog must not match by number if an input key was saved");
+
+    var session = new OperatorSession(core);
+    session.Update(MixerState.Off, vmix, 1000);
+    var baseline = core.Statuses().ToDictionary(p => p.Id, p => p.View);
+    Check(session.StartPagerCheck(pagers[0].Id, 1000) && !session.StartPagerCheck(pagers[0].Id, 1100),
+        "A test must not restart or replace a running simulation");
+    session.Update(MixerState.Off, vmix, 1000);
+    Check(core.Statuses().First(p => p.Id == pagers[0].Id).View is { Test: true, Inside: 2, Outside: 1 } &&
+        core.Statuses().First(p => p.Id == pagers[1].Id).View == baseline[pagers[1].Id], "Test was not isolated to the selected pager");
+    session.Update(MixerState.Off, vmix, 3000);
+    Check(core.Statuses().First(p => p.Id == pagers[0].Id).View is { Test: true, Inside: 1, Outside: 3 }, "Second test phase failed");
+    session.Update(MixerState.Off, vmix, 7000);
+    Check(core.Statuses().All(p => p.View == baseline[p.Id]) && !session.IsTesting(pagers[0].Id),
+        "Timer must remove only the temporary test and restore current live state");
+    using var restarted = new PilotCore(settings, port: 0);
+    Check(restarted.Statuses().First(p => p.Id == pagers[0].Id).Transport == "espnow-lr",
+        "The configured transport must be restored on restart");
+    Console.WriteLine("PASS readiness for sources, mappings, firmware, pager roles and base; single-pager test and automatic live restore");
+}
+
+static async Task TestDiagnosticStorage(string settings)
+{
+    string path = Path.Combine(settings, "history-test.json");
+    using (var log = new DiagnosticLog(path))
+    {
+        for (int i = 0; i < DiagnosticLog.Capacity + 5; i++) log.Add("Stick A", "Test", $"Ereignis {i}");
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(7));
+        while (!File.Exists(path)) await Task.Delay(50, timeout.Token);
+        var onDisk = JsonSerializer.Deserialize<DiagnosticEntry[]>(File.ReadAllText(path), ProfileStore.Json);
+        Check(onDisk is { Length: DiagnosticLog.Capacity } && onDisk[0].Detail == "Ereignis 5",
+            "Periodic saving should retain only the latest entries");
+        log.Add("PC", "Anwendung", "Beendet");
+    }
+    using (var restarted = new DiagnosticLog(path))
+        Check(restarted.Entries.Last().Detail == "Beendet" && restarted.Entries.Length == DiagnosticLog.Capacity,
+            "The final unsaved event must survive a restart");
+    File.WriteAllText(path, "{ broken data");
+    using (var repaired = new DiagnosticLog(path))
+    {
+        Check(repaired.StorageIssue is not null && repaired.Entries.Length == 0, "Corrupt history must not break the application");
+        repaired.Add("PC", "Anwendung", "Neuer Verlauf");
+    }
+    using var recovered = new DiagnosticLog(path);
+    Check(recovered.StorageIssue is null && recovered.Entries.Single().Detail == "Neuer Verlauf", "A new history must recover after bad data");
+    Console.WriteLine("PASS bounded diagnostic history, periodic saving, restart, shutdown flush and corrupt-file recovery");
+}
+
+static async Task TestGitHubUpdate(string settings, string firmware)
+{
+    string exe = Path.Combine(Path.GetDirectoryName(firmware)!, GitHubUpdates.ExeName);
+    if (!File.Exists(exe))
+    {
+        Console.WriteLine("SKIP paired updater test because the supplied firmware ZIP has no accompanying Windows EXE");
+        return;
+    }
+    static string Hash(string path)
+    {
+        using var stream = File.OpenRead(path);
+        return Convert.ToHexStringLower(SHA256.HashData(stream));
+    }
+    var version = Version.Parse(PagerUsb.Version);
+    string firmwareName = GitHubUpdates.FirmwareName(version);
+    string exeHash = Hash(exe);
+    byte[] sidecar = Encoding.ASCII.GetBytes($"{Hash(firmware)}  {firmwareName}\n");
+    var asset = new GitHubAsset(1, GitHubUpdates.ExeName, new FileInfo(exe).Length, "sha256:" + exeHash, "uploaded");
+    var release = new GitHubRelease($"v{version}", false, false,
+        [asset, new(2, firmwareName, new FileInfo(firmware).Length, null, "uploaded"),
+            new(3, firmwareName + ".sha256", sidecar.Length, null, "uploaded")]);
+    string root = Path.Combine(settings, "updates");
+    var progress = new Progress<string>(_ => { });
+    int executableDownloads = 0;
+    bool altered = false;
+    bool unsafeRedirect = false;
+    using var client = new HttpClient(new FakeHttp(request =>
+    {
+        var uri = request.RequestUri!;
+        if (uri.Host == "api.github.com" && uri.AbsolutePath.EndsWith("/latest", StringComparison.Ordinal))
+            return new(HttpStatusCode.OK) { Content = new StringContent(JsonSerializer.Serialize(release, ProfileStore.Json)) };
+        string name = Uri.UnescapeDataString(uri.Segments[^1]);
+        if (uri.Host == "github.com" && name == asset.Name)
+            return new(HttpStatusCode.Found)
+            {
+                Headers = { Location = new Uri(unsafeRedirect ? "https://example.invalid/payload" :
+                    "https://release-assets.githubusercontent.com/" + asset.Name) }
+            };
+        if (uri.Host == "release-assets.githubusercontent.com" && name == asset.Name)
+        {
+            executableDownloads++;
+            return new(HttpStatusCode.OK) { Content = altered ? new ByteArrayContent([1, 2, 3]) : new StreamContent(File.OpenRead(exe)) };
+        }
+        if (uri.Host == "github.com" && name == firmwareName)
+            return new(HttpStatusCode.OK) { Content = new StreamContent(File.OpenRead(firmware)) };
+        if (uri.Host == "github.com" && name == firmwareName + ".sha256")
+            return new(HttpStatusCode.OK) { Content = new ByteArrayContent(sidecar) };
+        throw new InvalidOperationException($"Unexpected connection to {uri.Host}");
+    }));
+    var updater = new GitHubUpdates(client);
+    try
+    {
+        var found = await updater.Check(CancellationToken.None);
+        Check(GitHubUpdates.ReleaseVersion(found) == version, "Release metadata read failed");
+        var update = await updater.Download(found, root, progress, CancellationToken.None);
+        Check(Hash(update.Executable) == exeHash && Hash(update.Firmware) == Hash(firmware) &&
+            Path.GetDirectoryName(update.Executable) == Path.Combine(root, version.ToString()),
+            "Matching executable and firmware must be installed together");
+        var repeat = await updater.Download(found, root, progress, CancellationToken.None);
+        Check(repeat == update && executableDownloads == 1, "An already verified update must not be downloaded again");
+        try
+        {
+            await updater.Download(found with { Tag = "v0.1.0" }, root, progress, CancellationToken.None);
+            throw new Exception("Downgrade accepted");
+        }
+        catch (InvalidOperationException) { }
+
+        string damaged = Path.Combine(root, "invalid");
+        altered = true;
+        try
+        {
+            var smallAsset = asset with { Size = 3 };
+            await updater.Download(found with { Assets = [smallAsset, .. found.Assets.Skip(1)] }, damaged, progress, CancellationToken.None);
+            throw new Exception("Damaged download accepted");
+        }
+        catch (InvalidDataException) { }
+        Check(!Directory.EnumerateFileSystemEntries(damaged).Any(), "Invalid assets or staging were left behind");
+        unsafeRedirect = true;
+        try
+        {
+            await updater.Download(found, damaged, progress, CancellationToken.None);
+            throw new Exception("Offsite redirect accepted");
+        }
+        catch (InvalidDataException) { }
+        Console.WriteLine("PASS GitHub updates, asset redirects, SHA-256, matched EXE/ZIP, no downgrades, caching and invalid downloads");
+    }
+    finally { if (Directory.Exists(root)) Directory.Delete(root, recursive: true); }
+}
+
+static void TestRadioBridge(string settings)
+{
+    const string address = "10061c286f4c";
+    Check(RadioBridge.Parse("TP LINK " + address + " TP1|hello") is { } parsed && parsed.Address == address &&
+        RadioBridge.Parse("TP LINK ffffffffffff TP1|hello") is null, "Serial bridge framing or peer filter failed");
+    foreach (string mode in new[] { "espnow", "espnow-lr", "ble" })
+    {
+        using var core = new PilotCore(settings, port: 0);
+        string key = core.Devices.Single().Key;
+        var bridge = new FakeRadio(mode);
+        core.AttachRadio(bridge);
+        const string nonce = "abcdefabcdefabcdefabcdefabcdefaa";
+        void Push(string body, string sender = address) => bridge.Inbound.Enqueue(new(sender, body + "|" + Tag(body, key)));
+        Push($"TP1|hello|{id}|{nonce}");
+        core.Tick();
+        var offer = bridge.Outbound.First().Payload.Split('|');
+        string session = offer[4];
+        string ready = $"TP1|ready|{id}|{nonce}|{session}";
+        Push(ready, "10061c286f40");
+        core.Tick();
+        Check(bridge.Outbound.All(p => !p.Payload.Contains("|state|")), "Different radio peer completed handshake");
+        Push(ready);
+        core.Tick();
+        var state = bridge.Outbound.Last().Payload.Split('|');
+        Push($"TP1|link|{id}|{session}|{state[4]}|88|-128|18|4|1");
+        core.Tick();
+        Check(bridge.Outbound.All(p => p.Address == address) && core.Statuses().Single() is
+            { Connection: Connection.Connected, Battery: 88, Rssi: null, Rtt: 18, Firmware.ExactVersion: false } status && status.Transport == mode,
+            "Wireless relay must preserve signed tally, receipts and per-mode status");
+        Push($"TP1|firmware|{id}|{session}|0.6.1|chat-ack,usb-config");
+        core.Tick();
+        Check(core.Statuses().Single() is { Firmware.VersionText: "0.6.1", Firmware.Advertised: true, CanAck: true },
+            "New radio firmware must be able to report its exact version independently of the bridge");
+        core.AttachRadio(null);
+        Check(bridge.Closed && !core.Statuses().Single().Online, "Detach must invalidate the radio session");
+    }
+    Console.WriteLine("PASS ESP-NOW, ESP-NOW LR and BLE bridge routing, signed sessions and peer isolation (simulated serial)");
+}
+
+static async Task TestWifiManagement(string settings)
+{
+    using var core = new PilotCore(settings, port: 0);
+    using var stick = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+    string key = core.Devices.Single().Key;
+    string session = Connect(stick, core, key, new string('e', 32));
+    void SendReport(string body)
+    {
+        Send(stick, core, body, Tag(body, key));
+        core.Tick();
+    }
+    SendReport($"TP1|link|{id}|{session}|1|90|-42|4|20|1");
+    SendReport($"TP1|cfg_info|{id}|{session}|0.6.0|192.168.1.2|5061676572|||idle");
+    var change = new WifiChange("Bühne", "192.168.1.20", "Guest", "temporary-secret");
+    Task<WifiSettings> request = core.ChangeWifi(id, change);
+    string[] command;
+    do { command = Read(stick, core, key); } while (command[1] != "cfg");
+    Check(command.Length == 9 && command[3] == session, "Config command must bind to the active UDP session");
+    byte[] k = HMACSHA256.HashData(Convert.FromHexString(key), "TallyPager WLAN config v1"u8);
+    byte[] plaintext = new byte[command[7].Length / 2];
+    using (var aes = new AesGcm(k, 16))
+        aes.Decrypt(Convert.FromHexString(command[6]), Convert.FromHexString(command[7]), Convert.FromHexString(command[8]),
+            plaintext, Encoding.ASCII.GetBytes(string.Join("|", command[2..6])));
+    Check(JsonSerializer.Deserialize<WifiChange>(plaintext, ProfileStore.Json) == change &&
+        !string.Join("|", command).Contains(change.Password), "Config payload must match the authenticated encryption contract");
+    string requestId = command[4];
+    SendReport($"TP1|cfg_info|{id}|{session}|0.6.0|192.168.1.2|5061676572||{requestId}|testing");
+    Check(!request.IsCompleted, "Testing must not report success");
+    SendReport($"TP1|cfg_info|{id}|{new string('f', 32)}|0.6.0|192.168.1.2|5061676572||{requestId}|applied");
+    Check(!request.IsCompleted, "Obsolete session must not complete a pending config");
+    SendReport($"TP1|cfg_info|{id}|{session}|0.6.0|192.168.1.2|5061676572||{requestId}|rollback");
+    Check((await request.WaitAsync(TimeSpan.FromSeconds(1))).Result == "rollback", "Rollback was not reported");
+    Console.WriteLine("PASS authenticated Wi-Fi settings, AES-GCM encoding, trial and rollback delivery");
+}
+
+static async Task TestWifiDiscovery(string settings)
+{
+    using var core = new PilotCore(settings, port: 0);
+    using var device = new UdpClient(new IPEndPoint(IPAddress.Loopback, PilotCore.ManagementPort));
+    string key = core.Devices.Single().Key;
+    core.DiscoverWifi(IPAddress.Loopback);
+    var challenge = Read(device, core, key);
+    Check(challenge is [_, "discover", id, _], "Expected a signed discovery request from the paired PC");
+    const string managementSession = "bafebafebafebafebafebafebafebafe";
+    void Response(string body)
+    {
+        Send(device, core, body, Tag(body, key));
+        core.Tick();
+    }
+    Response($"TP1|found|{id}|{new string('f', 32)}|{managementSession}|0.6.0|192.168.3.2|5061676572|||idle");
+    Check(core.Statuses().Single().Settings is null, "Unrequested discovery must not expose remote settings");
+    Response($"TP1|found|{id}|{challenge[3]}|{managementSession}|0.6.0|192.168.3.2|5061676572|||idle");
+    Check(core.Statuses().Single() is { Online: false, Settings.Host: "192.168.3.2" },
+        "The management interface must be available even without an active tally session");
+    Task<WifiSettings> change = core.ChangeWifi(id, new("Pager", "192.168.3.4", "", ""));
+    var wire = Read(device, core, key);
+    Check(wire[1] == "cfg" && wire[3] == managementSession, "Config command should use the authenticated management session");
+    Response($"TP1|cfg_info|{id}|{managementSession}|0.6.0|192.168.3.4|5061676572||{wire[4]}|applied");
+    Check((await change.WaitAsync(TimeSpan.FromSeconds(1))).Result == "applied", "Management response was ignored");
+    Console.WriteLine("PASS signed WLAN discovery and configuration without an active tally session");
+}
+
+static void TestAcknowledgements(string settings)
+{
+    using var core = new PilotCore(settings, port: 0);
+    string key = core.Devices.Single().Key;
+    using var stick = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+    using var reconnectedStick = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+    string firstSession = Connect(stick, core, key, new string('c', 32));
+    var operatorSession = new OperatorSession(core);
+    void Update() => operatorSession.Update(MixerState.Off, MixerState.Off, Environment.TickCount64);
+    void Report(UdpClient sender, string body)
+    {
+        Send(sender, core, body, Tag(body, key));
+        core.Tick();
+    }
+    operatorSession.SetText([id], "Position halten", "Taufe", ack: true);
+    Update();
+    string chatId = operatorSession.Message(id)!.Id;
+    var packet = Read(stick, core, key);
+    Check(packet.Length == 14 && packet[12] == chatId && packet[13] == "1", "ACK flag and chat ID missing");
+    Report(stick, $"TP1|caps|{id}|{firstSession}|ack");
+    Report(stick, $"TP1|chat_rcpt|{id}|{firstSession}|{chatId}|shown");
+    Check(core.Statuses().Single() is { CanAck: true, ReceivedAt: not null, AcknowledgedAt: null }, "Shown must not ACK");
+
+    string secondSession = Connect(reconnectedStick, core, key, new string('d', 32));
+    string oldAck = $"TP1|chat_rcpt|{id}|{firstSession}|{chatId}|ack";
+    Report(stick, oldAck);
+    Check(core.Statuses().Single().AcknowledgedAt is null, "Old endpoint/session must not ACK");
+    string ack = $"TP1|chat_rcpt|{id}|{secondSession}|{chatId}|ack";
+    Report(reconnectedStick, ack);
+    Check(Read(reconnectedStick, core, key) is [_, "chat_ok", id, _, var received] && received == chatId,
+        "ACK must be confirmed after reconnect");
+    var original = core.Statuses().Single().AcknowledgedAt;
+    Check(original is not null, "ACK must be recorded");
+    Report(reconnectedStick, ack);
+    Check(core.Statuses().Single().AcknowledgedAt == original, "ACK retransmission must be idempotent");
+    operatorSession.SetText([id], "Position halten", null, ack: true, ttl: 5);
+    Update();
+    Check(operatorSession.Message(id)!.Id != chatId && operatorSession.Text(id).Next == "Taufe", "Resend needs fresh ID and same Next");
+    Report(reconnectedStick, ack);
+    Check(core.Statuses().Single().AcknowledgedAt is null, "A late ACK must not confirm another message");
+    operatorSession.Update(MixerState.Off, MixerState.Off, Environment.TickCount64 + 6000);
+    Check(operatorSession.Text(id) == ("", "Taufe") && operatorSession.History.Select(entry => entry.Result)
+        .SequenceEqual(new[] { "Quittiert", "Abgelaufen" }), "Expiry must clear only Chat and retain closed outcomes");
+    Report(reconnectedStick, $"TP1|diag|{id}|{secondSession}|1|1|201|1513|2500|7|2100");
+    Check(core.Diagnostics.Entries.Length == 2, "WLAN and state timeouts must be logged separately");
+    Console.WriteLine("PASS authenticated chat receipts, reconnect, duplicate and late ACKs, expiry and diagnostics");
+}
+
+static void TestProfiles(string settings)
+{
+    using var core = new PilotCore(settings, port: 0);
+    string address = Path.Combine(settings, "arbiter-address.txt");
+    string export = Path.Combine(settings, "export.json");
+    File.WriteAllText(address, "localhost:4455");
+    var store = new ProfileStore(settings, core.Devices);
+    var active = store.Active;
+    var role = active.Roles.First(r => store.Bindings[r.Id] == id);
+    Check(active.Sources.Arbiter == "localhost:4455" && role.Inside?.Mixer == MixerKind.Off &&
+        role.Outside?.Mixer == MixerKind.Atem, "Legacy source, pairing and layer assignments must migrate");
+    var group = new TargetGroup(Guid.NewGuid(), "Kameras", [.. active.Roles.Select(r => r.Id)]);
+    var text = new QuickText(Guid.NewGuid(), "Position", "Position halten", "Taufe", [], group.Id, true, 120);
+    store.Update(active with { Groups = [group], Texts = [text] });
+    Check(store.Targets(text, core.Devices.Select(p => p.Id)).Devices.Length == 2, "Group must resolve both sticks");
+    var operatorSession = new OperatorSession(core, store);
+    operatorSession.SetText([id], "Laufende Anweisung", null);
+    store.Export(export, true);
+    string json = File.ReadAllText(export);
+    Check(!json.Contains(id) && !json.Contains(core.Devices[0].Key) && !json.Contains("Laufende Anweisung") &&
+        !File.ReadAllText(Path.Combine(settings, "devices.json")).Contains(core.Devices[0].Key), "Export or local storage leaked device secrets");
+    var incoming = ProfileStore.PreviewImport(export);
+    store.Import(incoming, false);
+    var copy = store.Backup.Profiles.Single(p => p.Id != active.Id);
+    Check(copy.Texts.Single().Id != text.Id && copy.Texts.Single().Group == copy.Groups.Single().Id &&
+        copy.Groups.Single().Roles.All(roleId => copy.Roles.Any(r => r.Id == roleId)) &&
+        store.Unbound(copy).Count() == 2, "Imported copy needs fresh IDs and explicit bindings");
+    store.Activate(copy.Id);
+    operatorSession.Reset();
+    operatorSession.Update(MixerState.Off, MixerState.Off, Environment.TickCount64);
+    Check(core.Statuses().All(p => p.View.InsideSource == "off" && p.View.Chat.Length == 0),
+        "Switch must clear messages and hide unbound roles");
+    var original = store.Backup;
+    try { store.Import(incoming with { Version = 999 }, true); throw new Exception("Invalid import accepted"); }
+    catch (InvalidDataException) { Check(store.Backup == original, "Invalid import must preserve local state"); }
+    store.Import(incoming, true);
+    Check(File.Exists(Path.Combine(settings, "profiles-before-import.json")) && store.Active.Id == active.Id &&
+        store.Active.Texts.Single().Id == text.Id && store.RoleFor(id)?.Id == role.Id, "Replace must preserve IDs and local bindings");
+    var reloaded = new ProfileStore(settings, core.Devices);
+    Check(reloaded.Active.Texts.Single().Id == text.Id, "Restore must survive restart");
+    Console.WriteLine("PASS profile migration, DPAPI storage, export, group resolution, copy, invalid import, restore and activation");
+}
+
+static async Task TestCompanion()
+{
+    int port;
+    using (var reserve = new TcpListener(IPAddress.Loopback, 0))
+    {
+        reserve.Start();
+        port = ((IPEndPoint)reserve.LocalEndpoint).Port;
+    }
+    int sends = 0;
+    string token = PilotCore.RandomHex(32);
+    var api = new CompanionApi(token, (command, _) => Task.FromResult(command.Action switch
+    {
+        "status" => new ApiReply(200, new { sends }),
+        "send" => new ApiReply(202, new { queued = Interlocked.Increment(ref sends) }),
+        _ => new ApiReply(202, new { Chat = command.Body!.Chat })
+    }), port);
+    try
+    {
+        await api.StartAsync();
+        using var client = new HttpClient { BaseAddress = new Uri($"http://127.0.0.1:{port}"), Timeout = TimeSpan.FromSeconds(5) };
+        Check((await client.GetAsync("/api/v1/status")).StatusCode == HttpStatusCode.Unauthorized, "API must require a token");
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        Check((await client.GetAsync("/api/v1/status")).IsSuccessStatusCode, "Authenticated status failed");
+        client.DefaultRequestHeaders.Add("Idempotency-Key", "simulate-retry");
+        string path = $"/api/v1/quick-texts/{Guid.NewGuid():D}/send";
+        Check((await client.PostAsync(path, null)).StatusCode == HttpStatusCode.Accepted &&
+            (await client.PostAsync(path, null)).StatusCode == HttpStatusCode.Accepted && sends == 1, "Retry must queue only once");
+        Check((await client.PostAsync($"/api/v1/quick-texts/{Guid.NewGuid():D}/send", null)).StatusCode == HttpStatusCode.Conflict,
+            "Idempotency key must be bound to a command");
+        client.DefaultRequestHeaders.Remove("Idempotency-Key");
+        string clear = JsonSerializer.Serialize(new ApiRequest(Guid.NewGuid(), [Guid.NewGuid()], true, false), ProfileStore.Json);
+        Check((await client.PostAsync("/api/v1/messages/clear", new StringContent(clear, Encoding.UTF8, "application/json")))
+            .StatusCode == HttpStatusCode.Accepted, "Clear contract failed");
+        Check((await client.PostAsync("/api/v1/messages/clear", new StringContent("{}", Encoding.UTF8, "application/json")))
+            .StatusCode == HttpStatusCode.BadRequest, "Invalid clear targets must be rejected");
+        Console.WriteLine("PASS local Companion HTTP start, bearer auth, status, idempotent send and targeted clear");
+    }
+    finally { await api.CloseAsync(); }
 }
 
 static void TestArbiter()
@@ -239,4 +706,35 @@ static async Task TestVmix()
     try { await server; }
     catch (IOException) { }
     Console.WriteLine("PASS vMix TCP subscription, interleaved tally and fragmented UTF-8 XML");
+}
+
+static async Task TestVmixFailure()
+{
+    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(7));
+    using var server = new TcpListener(IPAddress.Loopback, 0);
+    server.Start();
+    using var source = new VmixSource("127.0.0.1", ((IPEndPoint)server.LocalEndpoint).Port);
+    using var silent = await server.AcceptTcpClientAsync(timeout.Token);
+    while (!source.State.Status.Contains("Keine gültige Antwort auf SUBSCRIBE TALLY", StringComparison.Ordinal))
+        await Task.Delay(20, timeout.Token);
+    Check(source.State.Status.Contains("TCP verbunden", StringComparison.Ordinal) && source.State.Inputs.Length == 0,
+        "A connected TCP socket without vMix replies must stay gray and show the failed protocol stage");
+    Console.WriteLine("PASS vMix distinguishes TCP reachability and subscription timeout");
+}
+
+file sealed class FakeRadio(string mode) : IRadioBridge
+{
+    public string Mode { get; } = mode;
+    public Queue<RadioPacket> Inbound { get; } = new();
+    public List<RadioPacket> Outbound { get; } = [];
+    public bool Closed { get; private set; }
+    public bool TryRead(out RadioPacket packet) => Inbound.TryDequeue(out packet);
+    public bool Send(string address, string payload) { Outbound.Add(new(address, payload)); return true; }
+    public void Dispose() => Closed = true;
+}
+
+file sealed class FakeHttp(Func<HttpRequestMessage, HttpResponseMessage> respond) : HttpMessageHandler
+{
+    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
+        Task.FromResult(respond(request));
 }

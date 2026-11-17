@@ -124,6 +124,7 @@ internal sealed class VmixSource : IDisposable
     {
         while (!token.IsCancellationRequested)
         {
+            bool tcpConnected = false;
             try
             {
                 using var client = new TcpClient { NoDelay = true };
@@ -132,13 +133,23 @@ internal sealed class VmixSource : IDisposable
                     timeout.CancelAfter(3000);
                     await client.ConnectAsync(host, port, timeout.Token);
                 }
+                tcpConnected = true;
+                state = new("TCP erreichbar · warte auf SUBSCRIBE TALLY", []);
                 await Receive(client.GetStream(), token);
             }
             catch (Exception error) when (error is IOException or SocketException or OperationCanceledException or
                 System.Xml.XmlException or TimeoutException)
             {
                 if (token.IsCancellationRequested) return;
-                state = new("Verbindung fehlt · neuer Versuch", []);
+                string errorText = error switch
+                {
+                    SocketException socket => socket.SocketErrorCode.ToString(),
+                    OperationCanceledException => "Zeitüberschreitung",
+                    System.Xml.XmlException => "Ungültige XML-Eingangsliste",
+                    _ => error.Message
+                };
+                state = new(tcpConnected ? $"TCP verbunden, vMix-Protokoll: {errorText} · neuer Versuch" :
+                    $"TCP {host}:{port} nicht erreichbar · {errorText} · neuer Versuch", []);
             }
             try { await Task.Delay(1250, token); }
             catch (OperationCanceledException) { return; }
@@ -159,7 +170,8 @@ internal sealed class VmixSource : IDisposable
         while (!token.IsCancellationRequested)
         {
             long now = Environment.TickCount64;
-            if (request.Length > 0 && now >= deadline) throw new TimeoutException();
+            if (request.Length > 0 && now >= deadline)
+                throw new TimeoutException($"Keine gültige Antwort auf {request switch { "SUBSCRIBE" => "SUBSCRIBE TALLY", _ => request }}");
             if (request.Length == 0)
             {
                 if (now >= xmlDue)
@@ -185,8 +197,10 @@ internal sealed class VmixSource : IDisposable
             if (line.StartsWith("TALLY OK ", StringComparison.Ordinal))
             {
                 current = line[9..];
+                if (current.Length == 0 || current.Any(c => c is not ('0' or '1' or '2')))
+                    throw new IOException("Ungültige TALLY-Antwort.");
                 if (request == "TALLY") request = "";
-                Publish(inputs, metadata, current);
+                if (request != "SUBSCRIBE") Publish(inputs, metadata, current);
             }
             else if (line.StartsWith("XML ", StringComparison.Ordinal) &&
                 int.TryParse(line.AsSpan(4), NumberStyles.None, CultureInfo.InvariantCulture, out int length))
@@ -194,7 +208,10 @@ internal sealed class VmixSource : IDisposable
                 if (length is < 1 or > 4_000_000) throw new IOException("Ungültige vMix-XML-Länge.");
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
                 timeout.CancelAfter(3000);
-                string xml = Encoding.UTF8.GetString(await reader.Bytes(length, timeout.Token));
+                string xml;
+                try { xml = Encoding.UTF8.GetString(await reader.Bytes(length, timeout.Token)); }
+                catch (OperationCanceledException) when (!token.IsCancellationRequested)
+                { throw new TimeoutException("XML-Eingangsliste unvollständig."); }
                 var updated = ParseInputs(xml);
                 if (metadata && !inputs.Select(input => (input.Number, input.Key))
                     .SequenceEqual(updated.Select(input => (input.Number, input.Key))))
@@ -205,12 +222,16 @@ internal sealed class VmixSource : IDisposable
                 }
                 inputs = updated;
                 metadata = true;
-                request = "";
+                if (request == "XML") request = "";
                 Publish(inputs, metadata, current);
             }
-            else if (line == "SUBSCRIBE OK TALLY") request = "";
+            else if (line == "SUBSCRIBE OK TALLY" && request == "SUBSCRIBE")
+            {
+                request = "";
+                state = new("SUBSCRIBE TALLY bestätigt · warte auf XML-Eingänge und TALLY", []);
+            }
             else if (request.Length > 0 && line.StartsWith(request + " ER", StringComparison.Ordinal))
-                throw new IOException("vMix hat die Anfrage abgelehnt.");
+                throw new IOException($"vMix hat {request} abgelehnt.");
             lineTask = reader.Line(token);
         }
     }
@@ -219,7 +240,8 @@ internal sealed class VmixSource : IDisposable
     {
         if (!metadata || tally.Length == 0)
         {
-            state = new("Synchronisiere Eingänge …", inputs);
+            state = new(metadata ? "XML-Eingänge empfangen · warte auf TALLY" :
+                "TALLY empfangen · warte auf XML-Eingänge", inputs);
             return;
         }
         state = new("Verbunden", inputs.Select(input => input with
@@ -228,12 +250,17 @@ internal sealed class VmixSource : IDisposable
         }).ToArray());
     }
 
-    internal static MixerInput[] ParseInputs(string xml) =>
-        (XDocument.Parse(xml).Root?.Element("inputs")?.Elements("input") ?? [])
+    internal static MixerInput[] ParseInputs(string xml)
+    {
+        var root = XDocument.Parse(xml).Root;
+        if (root?.Name.LocalName != "vmix" || root.Element("inputs") is not { } inputs)
+            throw new IOException("XML-Antwort enthält keine vMix-Eingangsliste.");
+        return inputs.Elements("input")
         .Select(entry => new MixerInput(int.TryParse((string?)entry.Attribute("number"), out int number) ? number : 0,
             (string?)entry.Attribute("title") ?? "",
             0, (string?)entry.Attribute("key")))
         .Where(input => input.Number is > 0 and <= 1000).OrderBy(input => input.Number).ToArray();
+    }
 
     internal static int DecodeTally(char tally) => tally switch { '0' => 1, '1' => 3, '2' => 2, _ => 0 };
 

@@ -3,6 +3,8 @@ name: Windows pilot
 on:
   workflow_dispatch:
   push:
+    tags:
+      - 'v*'
     paths:
       - 'desktop/**'
       - 'CameraCue/**'
@@ -12,6 +14,8 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
@@ -39,3 +43,33 @@ jobs:
             dist/**/*.sha256
             dist/**/*LICENSE.txt
             dist/**/THIRD-PARTY-NOTICES.txt
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: TallyPager-Windows-x64
+          path: release
+      - name: Publish matching Windows app and firmware
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_REF_NAME -cnotmatch '^v(\d+\.\d+\.\d+)$') { throw 'Stable release version required.' }
+          $version = $Matches[1]
+          $exe = 'TallyPager-Windows-x64.exe'
+          $zip = "TallyPager-Firmware-M5StickC-Plus2-$version.zip"
+          $candidates = @(Get-ChildItem release -Recurse -Filter $exe)
+          if ($candidates.Count -ne 1 -or $candidates[0].Directory.Name -ne $version) { throw 'Build and Git tag do not match.' }
+          $folder = $candidates[0].Directory.FullName
+          $assets = @($exe, $zip, "$exe.sha256", "$zip.sha256", 'THIRD-PARTY-NOTICES.txt', 'esptool-LICENSE.txt') |
+            ForEach-Object { (Get-Item -LiteralPath (Join-Path $folder $_)).FullName }
+          gh release create $env:GITHUB_REF_NAME @assets --verify-tag --latest --title "TallyPager $version" --generate-notes
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub release publication failed.' }

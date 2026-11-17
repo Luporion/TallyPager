@@ -1,0 +1,128 @@
+openapi: 3.1.2
+info:
+  title: TallyPager Companion API
+  version: 0.6.0
+servers:
+  - url: http://127.0.0.1:46225
+security:
+  - localToken: []
+paths:
+  /api/v1/status:
+    get:
+      operationId: getActiveProfileStatus
+      responses:
+        '200':
+          description: Active profile, available quick texts and groups, and device/receipt status by role
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [profile, quickTexts, groups, roles]
+                properties:
+                  profile:
+                    type: object
+                    required: [id, name]
+                    properties:
+                      id: { type: string, format: uuid }
+                      name: { type: string }
+                  quickTexts: { type: array, items: { type: object } }
+                  groups: { type: array, items: { type: object } }
+                  roles:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, name, connection]
+                      properties:
+                        id: { type: string, format: uuid }
+                        name: { type: string }
+                        middleCamera: { type: [integer, 'null'] }
+                        device: { type: [string, 'null'] }
+                        connection: { enum: [Connected, Delayed, Disconnected, Unbound] }
+                        transport: { enum: [udp, espnow, espnow-lr, ble, null] }
+                        rtt: { type: [integer, 'null'], description: Milliseconds }
+                        rssi: { type: [integer, 'null'], description: dBm }
+                        battery: { type: [integer, 'null'], description: Percent }
+                        inside: { enum: [0, 1, 2, 3, null], description: 'Unknown, inactive, preview, program' }
+                        outside: { enum: [0, 1, 2, 3, null], description: 'Unknown, inactive, preview, program' }
+                        insideSource: { type: [string, 'null'] }
+                        outsideSource: { type: [string, 'null'] }
+                        chat: { type: [string, 'null'], description: Localized delivery status }
+                        chatId: { type: [string, 'null'], description: 32 lowercase hex characters or empty }
+                        receivedAt: { type: [string, 'null'], format: date-time }
+                        acknowledgedAt: { type: [string, 'null'], format: date-time }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { description: Regie window unavailable }
+  /api/v1/quick-texts/{id}/send:
+    post:
+      operationId: sendQuickText
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '202': { $ref: '#/components/responses/Queued' }
+        '400': { description: Invalid request or idempotency key }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: Quick text absent from the active profile }
+        '409': { description: All targeted roles are unbound, or the request reused a key for another operation }
+        '503': { description: Regie window unavailable }
+  /api/v1/messages/clear:
+    post:
+      operationId: clearMessages
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [profileId, roles]
+              properties:
+                profileId: { type: string, format: uuid }
+                roles:
+                  type: array
+                  minItems: 1
+                  maxItems: 200
+                  items: { type: string, format: uuid }
+                chat: { type: boolean, default: false }
+                next: { type: boolean, default: false }
+              anyOf:
+                - required: [chat]
+                  properties: { chat: { const: true } }
+                - required: [next]
+                  properties: { next: { const: true } }
+      responses:
+        '202': { $ref: '#/components/responses/Queued' }
+        '400': { description: Invalid request or idempotency key }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: Unknown camera role }
+        '409': { description: Profile inactive, all targeted roles unbound, or idempotency conflict }
+        '503': { description: Regie window unavailable }
+components:
+  securitySchemes:
+    localToken:
+      type: http
+      scheme: bearer
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      description: Unique per intentional action. The API retains the last 256 accepted calls with keys until it is stopped.
+      schema: { type: string, pattern: '^[A-Za-z0-9_-]{1,96}$' }
+  responses:
+    Unauthorized:
+      description: A valid local bearer token is required.
+    Queued:
+      description: Action accepted for at least one paired device. Delivery and ACK are reported separately.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [queued, missingRoles]
+            properties:
+              queued: { type: integer, minimum: 1 }
+              missingRoles: { type: array, items: { type: string } }

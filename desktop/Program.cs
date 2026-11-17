@@ -3,17 +3,21 @@ using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text;
+using System.Diagnostics;
 
 namespace TallyPager;
 
 internal static class Program
 {
     [STAThread]
-    private static void Main()
+    private static void Main(string[] args)
     {
         ApplicationConfiguration.Initialize();
         try
         {
+            if (args is ["--wait-for-tallypager", var pidText, var startedText] &&
+                int.TryParse(pidText, out var pid) && long.TryParse(startedText, out var ticks))
+                WaitForPreviousApp(pid, ticks);
             using var core = new PilotCore();
             using var window = new MainWindow(core);
             Application.Run(window);
@@ -24,12 +28,23 @@ internal static class Program
                 "TallyPager", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
+
+    private static void WaitForPreviousApp(int pid, long ticks)
+    {
+        try
+        {
+            using var previous = Process.GetProcessById(pid);
+            if (previous.StartTime.ToUniversalTime().Ticks == ticks && !previous.WaitForExit(20000))
+                throw new TimeoutException("Die bisherige TallyPager-App läuft noch. Bitte schließen und die neue EXE öffnen.");
+        }
+        catch (ArgumentException) { }
+        catch (InvalidOperationException) { }
+    }
 }
 
-internal sealed class MainWindow : Form
+internal sealed partial class MainWindow : Form
 {
     private static readonly string[] States = ["Unbekannt", "Inaktiv", "Preview", "Program"];
-    private static readonly string ArbiterAddressFile = Path.Combine(PilotCore.DataDirectory, "arbiter-address.txt");
     private readonly PilotCore core;
     private readonly OperatorSession session;
     private readonly DataGridView devices = new()
@@ -62,11 +77,13 @@ internal sealed class MainWindow : Form
     private readonly NumericUpDown interval = new() { Minimum = 0.5m, Maximum = 60, Value = 3, Increment = 0.5m, DecimalPlaces = 1 };
     private readonly Label atemStatus = Notice(), vmixStatus = Notice(), arbiterStatus = Notice(), mappingStatus = Notice();
     private readonly Label usbStatus = Notice(), chatStatus = Notice(), simStatus = Notice();
+    private readonly Button connectAtem = Action("Verbinden"), connectVmix = Action("Verbinden"), connectArbiter = Action("Verbinden");
     private readonly TabControl tabs = new() { Dock = DockStyle.Fill };
     private readonly TabPage overview = new("Regie");
-    private readonly TabPage sources = new("Quellen und Zuordnung");
+    private readonly TabPage sources = new("Externe Verbindungen");
     private readonly TabPage simulation = new("Simulation");
-    private readonly TabPage setup = new("Stick einrichten");
+    private readonly TabPage setup = new("Stick einrichten/verwalten");
+    private readonly Label selectedFirmware = Notice();
     private readonly System.Windows.Forms.Timer timer = new() { Interval = 25 };
     private AtemSource? atem;
     private VmixSource? vmix;
@@ -80,7 +97,8 @@ internal sealed class MainWindow : Form
     public MainWindow(PilotCore core)
     {
         this.core = core;
-        session = new(core);
+        profiles = new(core.StorageDirectory, core.Devices);
+        session = new(core, profiles);
         Text = "TallyPager " + PagerUsb.Version;
         Font = new Font("Segoe UI", 10);
         StartPosition = FormStartPosition.CenterScreen;
@@ -89,20 +107,29 @@ internal sealed class MainWindow : Form
         BackColor = Color.FromArgb(241, 245, 249);
         ForeColor = Color.FromArgb(22, 34, 49);
 
-        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(16), ColumnCount = 1, RowCount = 3 };
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(16), ColumnCount = 1, RowCount = 4 };
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 165));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        layout.Controls.Add(new Label
+        var header = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, AutoSize = true };
+        header.ColumnStyles.Add(new(SizeType.Percent, 100));
+        header.ColumnStyles.Add(new(SizeType.AutoSize));
+        header.Controls.Add(new Label
         {
             Text = "TallyPager", Font = new Font("Segoe UI", 19, FontStyle.Bold), AutoSize = true,
             Margin = new Padding(1, 0, 0, 9)
         }, 0, 0);
+        header.Controls.Add(Action("Updates", (_, _) => OpenUpdates()), 1, 0);
+        layout.Controls.Add(header, 0, 0);
         layout.Controls.Add(devices, 0, 1);
-        layout.Controls.Add(tabs, 0, 2);
+        selectedFirmware.MaximumSize = new Size(800, 0);
+        selectedFirmware.Margin = new Padding(3, 3, 3, 7);
+        layout.Controls.Add(selectedFirmware, 0, 2);
+        layout.Controls.Add(tabs, 0, 3);
         Controls.Add(layout);
 
-        foreach (string column in new[] { "Stick", "Modus", "Innen", "Außen", "Verbindung", "WLAN", "RTT", "Akku", "Anzeige" })
+        foreach (string column in new[] { "Stick", "Modus", "Innen", "Außen", "Verbindung", "WLAN", "RTT", "Akku", "Anzeige", "Chat", "Firmware" })
         {
             int index = devices.Columns.Add(column, column);
             devices.Columns[index].SortMode = DataGridViewColumnSortMode.NotSortable;
@@ -111,13 +138,17 @@ internal sealed class MainWindow : Form
         devices.Columns[4].FillWeight = 115;
         devices.Columns[6].FillWeight = 65;
         devices.Columns[7].FillWeight = 60;
+        devices.Columns["Firmware"]!.FillWeight = 120;
 
         tabs.TabPages.AddRange([overview, sources, simulation, setup]);
         AddOverview();
         AddSources();
         AddSimulation();
         AddSetup();
-        LoadArbiterAddress();
+        AddConnectionTools();
+        AddRegieTools();
+        LoadSources();
+        ConnectProfileSources();
         ScanPorts();
         foreach (string address in FindAddresses()) addresses.Items.Add(address);
         if (addresses.Items.Count > 0) addresses.SelectedIndex = 0;
@@ -128,20 +159,24 @@ internal sealed class MainWindow : Form
         devices.SelectionChanged += (_, _) => SelectionChanged();
         SelectionChanged();
         timer.Tick += (_, _) => UpdateNetwork();
+        core.Diagnostics.Add("PC", "Anwendung", $"TallyPager {PagerUsb.Version} gestartet");
         timer.Start();
         FormClosing += (_, e) => { if (busy) e.Cancel = true; };
         FormClosed += (_, _) =>
         {
             timer.Dispose();
+            core.Diagnostics.Add("PC", "Anwendung", "TallyPager beendet");
             atem?.Dispose();
             vmix?.Dispose();
             arbiter?.Dispose();
+            companion?.Dispose();
         };
     }
 
     private void AddOverview()
     {
         var grid = Grid(overview, "Chat und Next");
+        Full(grid, Buttons(Action("Regiecheck", (_, _) => OpenRegieCheck())));
         Full(grid, new Label { AutoSize = true, Text = "Oben einen oder mehrere Sticks auswählen." });
         Row(grid, "Chat", chat, InlineButtons(Action("Leeren", (_, _) => SendText(true, false, clear: true)),
             Action("Senden", (_, _) => SendText(true, false))));
@@ -150,14 +185,17 @@ internal sealed class MainWindow : Form
         Full(grid, Buttons(Action("Chat und Next senden", (_, _) => SendText(true, true)),
             Action("Chat und Next leeren", (_, _) => SendText(true, true, clear: true))));
         Full(grid, chatStatus);
+        Full(grid, requireManualAck);
+        Row(grid, "Schnelltext", favorite, InlineButtons(Action("Übernehmen", (_, _) => LoadQuick()),
+            Action("Direkt senden", (_, _) =>
+            {
+                if (favorite.SelectedItem is QuickText text) chatStatus.Text = SendQuick(text).Message;
+            })));
     }
 
     private void AddSources()
     {
-        var grid = Grid(sources, "Quellen verbinden");
-        var connectAtem = Action("Verbinden");
-        var connectVmix = Action("Verbinden");
-        var connectArbiter = Action("Verbinden");
+        var grid = Grid(sources, "Mixer und Zuordnung");
         connectAtem.Click += (_, _) => ToggleAtem(connectAtem);
         connectVmix.Click += (_, _) => ToggleVmix(connectVmix);
         connectArbiter.Click += (_, _) => ToggleArbiter(connectArbiter);
@@ -182,6 +220,7 @@ internal sealed class MainWindow : Form
         Full(grid, Buttons(Action("Innen und außen tauschen", (_, _) => Swap()),
             Action("Zuordnung speichern", (_, _) => SaveMapping())));
         Full(grid, mappingStatus);
+        AddCompanion(grid);
     }
 
     private void AddSimulation()
@@ -207,16 +246,51 @@ internal sealed class MainWindow : Form
 
     private void AddSetup()
     {
-        var grid = Grid(setup, "M5StickC Plus2 einrichten");
+        var page = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, BackColor = Color.White };
+        page.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        page.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        setup.Controls.Add(page);
+        var header = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, Padding = new Padding(20, 9, 0, 0) };
+        var method = Choices();
+        method.AccessibleName = "Verbindungsart";
+        method.Items.AddRange(["USB", "WLAN"]);
+        header.Controls.Add(new Label { Text = "Verbindungsart", AutoSize = true, Margin = new Padding(0, 7, 12, 0) });
+        header.Controls.Add(method);
+        page.Controls.Add(header, 0, 0);
+        var content = new Panel { Dock = DockStyle.Fill };
+        var usb = new Panel { Dock = DockStyle.Fill };
+        var wireless = new Panel { Dock = DockStyle.Fill };
+        content.Controls.AddRange([wireless, usb]);
+        page.Controls.Add(content, 0, 1);
+        method.SelectedIndexChanged += (_, _) =>
+        {
+            wifiSetupSelected = method.SelectedIndex == 1;
+            usb.Visible = !wifiSetupSelected;
+            wireless.Visible = wifiSetupSelected;
+            RefreshConnectionTools();
+        };
+
+        var grid = Grid(usb, "USB-Einrichtung");
         Row(grid, "USB-Anschluss", ports, Action("Ports suchen", (_, _) => ScanPorts()));
+        ports.SelectedIndexChanged += (_, _) => usbFirmware.Text = "";
+        Full(grid, Buttons(Action("Firmware lesen", async (_, _) => await InspectUsb(ports, usbFirmware))));
+        Full(grid, usbFirmware);
         Row(grid, "Firmwarepaket", firmware, Action("ZIP auswählen", (_, _) => SelectFirmware()));
+        Row(grid, "Funkmodus", pagerTransport);
         Row(grid, "Adresse dieses PCs", addresses);
         Row(grid, "Name des Sticks", pagerName);
         Row(grid, "WLAN-Name", ssid);
         Row(grid, "WLAN-Passwort", password);
-        Full(grid, Action("Stick einrichten", async (_, _) => await Provision()));
+        Row(grid, "Adresse der Funkbasis", gatewayAddress);
+        Row(grid, "ESP-NOW-Kanal", pagerChannel);
+        Full(grid, Buttons(Action("Stick einrichten", async (_, _) => await Provision()),
+            Action("Firmware aktualisieren", async (_, _) => await UpdateUsbFirmware())));
         Full(grid, usbStatus);
         usbStatus.Text = "Bei leeren WLAN-Feldern verwendet der Stick die gespeicherte Verbindung.";
+        pagerTransport.SelectedIndexChanged += (_, _) => UpdateProvisionFields();
+        pagerTransport.SelectedIndex = 0;
+        AddWifiSetup(wireless);
+        method.SelectedIndex = 0;
     }
 
     private void SelectFirmware()
@@ -232,15 +306,24 @@ internal sealed class MainWindow : Form
     private async Task Provision()
     {
         if (busy) return;
-        if (ports.SelectedItem is not string port || !IPAddress.TryParse(addresses.Text, out var host) ||
-            host.AddressFamily != AddressFamily.InterNetwork || IPAddress.IsLoopback(host) || host.Equals(IPAddress.Any))
+        string mode = SelectedTransport(pagerTransport);
+        string host = addresses.Text.Trim();
+        string gateway = gatewayAddress.Text.Trim().Replace(":", "").Replace("-", "").ToLowerInvariant();
+        int channel = (int)pagerChannel.Value;
+        if (ports.SelectedItem is not string port || mode == "udp" && !WifiManagement.ValidHost(host) ||
+            IsEspNow(mode) && !Transport.IsMac(gateway))
         {
-            usbStatus.Text = "Bitte einen COM-Port und die IPv4-Adresse des PCs im Kameranetz wählen.";
+            usbStatus.Text = "Bitte USB-Port und je nach Modus PC-IPv4 oder die ESP-NOW-Basisadresse eingeben.";
             return;
         }
-        string name = pagerName.Text.Trim(), network = ssid.Text, secret = password.Text, package = firmware.Text;
-        if (name.Length == 0 || Encoding.UTF8.GetByteCount(name) > 48 || Encoding.UTF8.GetByteCount(network) > 32 ||
-            Encoding.UTF8.GetByteCount(secret) > 64 || (network.Length == 0 && secret.Length != 0))
+        if (activeRadio?.Port == port)
+        {
+            usbStatus.Text = "Dieser USB-Port ist mit der Funkbasis verbunden. Verbindung zuerst im Tab Funkbasis trennen.";
+            return;
+        }
+        string name = pagerName.Text.Trim(), network = mode == "udp" ? ssid.Text : "", secret = mode == "udp" ? password.Text : "";
+        if (name.Length == 0 || !ProfileStore.TextOk(name, 48) || !ProfileStore.TextOk(network, 32) ||
+            !ProfileStore.TextOk(secret, 64) || (network.Length == 0 && secret.Length != 0))
         {
             usbStatus.Text = "Name und WLAN-Daten prüfen. Für gespeichertes WLAN beide WLAN-Felder leer lassen.";
             return;
@@ -250,30 +333,26 @@ internal sealed class MainWindow : Form
         try
         {
             usbStatus.Text = $"Prüfe {port} …";
-            UsbStatus? current = null;
-            try { current = await Task.Run(() => PagerUsb.ReadStatus(port, TimeSpan.FromSeconds(2))); }
-            catch (TimeoutException) { }
-            if (current?.Version != PagerUsb.Version)
+            var current = await ReadUsbFirmware(port, usbFirmware);
+            if (current.Firmware?.AllowsUsbMode(mode) != true)
             {
-                if (!File.Exists(package))
-                {
-                    usbStatus.Text = "Bitte das separate Firmwarepaket " + PagerUsb.FirmwareFileName + " auswählen.";
-                    return;
-                }
-                var answer = MessageBox.Show(this, $"TallyPager {PagerUsb.Version} auf den M5StickC Plus2 an {port} schreiben?",
-                    "Firmware aktualisieren", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
-                if (answer != DialogResult.Yes) return;
-                var progress = new Progress<string>(value => usbStatus.Text = value);
-                await Task.Run(() => PagerUsb.Flash(port, package, progress));
-                current = await Task.Run(() => PagerUsb.ReadStatus(port, TimeSpan.FromSeconds(8)));
-                if (current.Version != PagerUsb.Version) throw new InvalidOperationException("Firmware nach Neustart nicht bestätigt.");
+                usbStatus.Text = $"Firmware {current.Version} bietet die USB-Einrichtung für {Transport.Name(mode)} nicht an.";
+                return;
             }
             var pager = core.Prepare(current.Id, name);
             core.Save(pager);
             usbStatus.Text = "Schreibe Einstellungen und prüfe den Neustart …";
-            var result = await Task.Run(() => PagerUsb.Configure(port, pager, host.ToString(), network, secret));
+            var result = await Task.Run(() => PagerUsb.Configure(port, pager, host, network, secret,
+                mode, IsEspNow(mode) ? gateway : "", channel));
+            if (pager.ConfiguredTransport != result.Mode)
+                core.Save(pager with { ConfiguredTransport = result.Mode });
+            ShowUsbFirmware(result, usbFirmware);
+            if (profiles.RoleFor(pager.Id) is null && !profiles.Unbound(profiles.Active).Any())
+                profiles.Bind(pager.Id, new(Guid.NewGuid(), pager.Name, pager.Inside, pager.Outside));
+            RefreshProfileChoices();
             password.Clear();
-            usbStatus.Text = result.Wifi ? $"USB-Einrichtung bestätigt. Stick-IP: {result.Ip}." :
+            usbStatus.Text = mode != "udp" ? $"Funkmodus {Transport.Name(result.Mode)} am Stick gespeichert." :
+                result.Wifi ? $"USB-Einrichtung bestätigt. Stick-IP {result.Ip}." :
                 "USB-Einrichtung bestätigt. Der Stick versucht, sich mit dem WLAN zu verbinden.";
             RefreshRows();
             devices.ClearSelection();
@@ -291,9 +370,17 @@ internal sealed class MainWindow : Form
     {
         try
         {
-            if (atem is not null) { atem.Dispose(); atem = null; }
+            if (atem is not null)
+            {
+                StoreSources(profiles.Active.Sources with { AtemEnabled = false });
+                atem.Dispose();
+                atem = null;
+            }
             else if (IPAddress.TryParse(atemHost.Text, out var ip) && ip.AddressFamily == AddressFamily.InterNetwork)
+            {
+                StoreSources(profiles.Active.Sources with { Atem = ip.ToString(), AtemEnabled = true });
                 atem = new AtemSource(ip.ToString());
+            }
             else { atemStatus.Text = "Bitte eine gültige ATEM-IPv4-Adresse eingeben."; return; }
             button.Text = atem is null ? "Verbinden" : "Trennen";
             atemStatus.Text = atem?.State.Status ?? MixerState.Off.Status;
@@ -303,9 +390,17 @@ internal sealed class MainWindow : Form
 
     private void ToggleVmix(Button button)
     {
-        if (vmix is not null) { vmix.Dispose(); vmix = null; }
+        if (vmix is not null)
+        {
+            if (!ProfileAction(() => StoreSources(profiles.Active.Sources with { VmixEnabled = false }), vmixStatus)) return;
+            vmix.Dispose();
+            vmix = null;
+        }
         else if (Uri.CheckHostName(vmixHost.Text.Trim()) != UriHostNameType.Unknown)
+        {
+            if (!ProfileAction(() => StoreSources(profiles.Active.Sources with { Vmix = vmixHost.Text.Trim(), VmixEnabled = true }), vmixStatus)) return;
             vmix = new VmixSource(vmixHost.Text.Trim());
+        }
         else { vmixStatus.Text = "Bitte die vMix-IP oder den Rechnernamen eingeben."; return; }
         button.Text = vmix is null ? "Verbinden" : "Trennen";
         vmixStatus.Text = vmix?.State.Status ?? MixerState.Off.Status;
@@ -313,29 +408,20 @@ internal sealed class MainWindow : Form
 
     private void ToggleArbiter(Button button)
     {
-        if (arbiter is not null) { arbiter.Dispose(); arbiter = null; }
+        if (arbiter is not null)
+        {
+            if (!ProfileAction(() => StoreSources(profiles.Active.Sources with { ArbiterEnabled = false }), arbiterStatus)) return;
+            arbiter.Dispose();
+            arbiter = null;
+        }
         else if (TallyArbiterSource.Endpoint(arbiterHost.Text) is { } endpoint)
         {
+            if (!ProfileAction(() => StoreSources(profiles.Active.Sources with { Arbiter = arbiterHost.Text.Trim(), ArbiterEnabled = true }), arbiterStatus)) return;
             arbiter = new TallyArbiterSource(endpoint);
-            try
-            {
-                Directory.CreateDirectory(PilotCore.DataDirectory);
-                File.WriteAllText(ArbiterAddressFile, arbiterHost.Text.Trim());
-            }
-            catch (Exception error) when (error is IOException or UnauthorizedAccessException) { }
         }
         else { arbiterStatus.Text = "Bitte Host, Host:Port oder eine HTTP-/HTTPS-Adresse eingeben."; return; }
         button.Text = arbiter is null ? "Verbinden" : "Trennen";
         arbiterStatus.Text = arbiter?.State.Status ?? ArbiterState.Off.Status;
-    }
-
-    private void LoadArbiterAddress()
-    {
-        try
-        {
-            if (File.Exists(ArbiterAddressFile)) arbiterHost.Text = File.ReadAllText(ArbiterAddressFile);
-        }
-        catch (Exception error) when (error is IOException or UnauthorizedAccessException) { }
     }
 
     private string[] SelectedIds() => devices.SelectedRows.Cast<DataGridViewRow>()
@@ -348,12 +434,14 @@ internal sealed class MainWindow : Form
         if (mappingId is { } id)
         {
             var pager = core.Devices.First(device => device.Id == id);
-            ShowMapping(insideSource, insideInput, pager.Inside ?? OperatorSession.DefaultInside);
-            ShowMapping(outsideSource, outsideInput, pager.Outside ?? OperatorSession.DefaultOutside);
+            var role = profiles.RoleFor(id);
+            ShowMapping(insideSource, insideInput, role?.Inside ?? OperatorSession.DefaultInside);
+            ShowMapping(outsideSource, outsideInput, role?.Outside ?? OperatorSession.DefaultOutside);
             var message = session.Text(id);
             chat.Text = message.Chat;
             next.Text = message.Next;
-            mappingStatus.Text = pager.Name;
+            mappingStatus.Text = role is null ? $"{pager.Name} · keine Kamera-Rolle gebunden." : $"{pager.Name} · {role.Name}";
+            if (role is not null) roleChoice.SelectedItem = role;
         }
         else
         {
@@ -361,6 +449,7 @@ internal sealed class MainWindow : Form
             next.Clear();
             mappingStatus.Text = "Für die Zuordnung genau einen Stick auswählen.";
         }
+        ShowSelectedFirmware();
     }
 
     private void ShowMapping(ComboBox source, ComboBox input, Assignment mapping)
@@ -427,8 +516,9 @@ internal sealed class MainWindow : Form
     {
         if (mappingId is not { } id) return;
         var pager = core.Devices.First(device => device.Id == id);
-        var inside = AssignmentFor(insideSource, insideInput) ?? pager.Inside ?? OperatorSession.DefaultInside;
-        var outside = AssignmentFor(outsideSource, outsideInput) ?? pager.Outside ?? OperatorSession.DefaultOutside;
+        var role = profiles.RoleFor(id);
+        var inside = AssignmentFor(insideSource, insideInput) ?? role?.Inside ?? OperatorSession.DefaultInside;
+        var outside = AssignmentFor(outsideSource, outsideInput) ?? role?.Outside ?? OperatorSession.DefaultOutside;
         ShowMapping(insideSource, insideInput, outside);
         ShowMapping(outsideSource, outsideInput, inside);
         SaveAssignment(pager, outside, inside);
@@ -450,12 +540,13 @@ internal sealed class MainWindow : Form
 
     private void SaveAssignment(Pager pager, Assignment inside, Assignment outside)
     {
-        try
+        ProfileAction(() =>
         {
-            core.Save(pager with { Inside = inside, Outside = outside });
-            mappingStatus.Text = $"Zuordnung für {pager.Name} gespeichert.";
-        }
-        catch (IOException error) { mappingStatus.Text = error.Message; }
+            var role = profiles.RoleFor(pager.Id) ?? new CameraRole(Guid.NewGuid(), pager.Name, null, null);
+            profiles.Bind(pager.Id, role with { Inside = inside, Outside = outside });
+            RefreshProfileChoices();
+            mappingStatus.Text = $"Zuordnung für {role.Name} gespeichert.";
+        }, mappingStatus);
     }
 
     protected override bool ProcessCmdKey(ref Message message, Keys keyData)
@@ -481,11 +572,11 @@ internal sealed class MainWindow : Form
             chatStatus.Text = "Bitte Chat oder Next kürzen und Steuerzeichen entfernen.";
             return;
         }
-        session.SetText(ids, message, upcoming);
+        session.SetText(ids, message, upcoming, requireManualAck.Checked);
         if (clear && updateChat) chat.Clear();
         if (clear && updateNext) next.Clear();
         string fields = updateChat && updateNext ? "Chat und Next" : updateChat ? "Chat" : "Next";
-        chatStatus.Text = $"{fields} für {ids.Length} Stick(s) {(clear ? "geleert" : "gesendet")}.";
+        chatStatus.Text = $"{fields} für {ids.Length} Stick(s) {(clear ? "geleert" : "in die Warteschlange gestellt")}.";
     }
 
     private void Simulate()
@@ -511,12 +602,17 @@ internal sealed class MainWindow : Form
             var v = vmix?.State ?? MixerState.Off;
             var ta = arbiter?.State ?? ArbiterState.Off;
             long now = Environment.TickCount64;
+            if (lastTick != 0 && now - lastTick >= 350)
+                core.Diagnostics.Add("PC", "Sendezyklus", $"Pause {now - lastTick} ms");
+            lastTick = now;
             session.Update(a, v, now, ta);
             core.Tick();
             if (now - lastUi < 250) return;
             lastUi = now;
             UpdateMixerUi(a, v, ta);
             RefreshRows();
+            RefreshDiagnostics(v);
+            RefreshConnectionTools();
         }
         catch (SocketException) { chatStatus.Text = "Netzwerkfehler. Bitte LAN und UDP-Port 46224 prüfen."; }
     }
@@ -524,9 +620,9 @@ internal sealed class MainWindow : Form
     private void UpdateMixerUi(MixerState a, MixerState v, ArbiterState ta)
     {
         if (ReferenceEquals(a, lastAtem) && ReferenceEquals(v, lastVmix) && ReferenceEquals(ta, lastArbiter)) return;
-        if (!ReferenceEquals(a, lastAtem)) atemStatus.Text = a.Status;
-        if (!ReferenceEquals(v, lastVmix)) vmixStatus.Text = v.Status;
-        if (!ReferenceEquals(ta, lastArbiter)) arbiterStatus.Text = ta.Status;
+        LogMixer("ATEM", atemStatus, lastAtem.Status, a.Status);
+        LogMixer("vMix", vmixStatus, lastVmix.Status, v.Status);
+        LogMixer("Tally Arbiter", arbiterStatus, lastArbiter.Status, ta.Status);
         bool listChanged = !SameInputs(a.Inputs, lastAtem.Inputs) || !SameInputs(v.Inputs, lastVmix.Inputs) ||
             !SameInputs(ta.Devices, lastArbiter.Devices) || !SameInputs(ta.Atem, lastArbiter.Atem) ||
             !SameInputs(ta.Vmix, lastArbiter.Vmix);
@@ -535,11 +631,11 @@ internal sealed class MainWindow : Form
         lastArbiter = ta;
         if (listChanged && mappingId is { } id)
         {
-            var pager = core.Devices.First(device => device.Id == id);
+            var role = profiles.RoleFor(id);
             ShowMapping(insideSource, insideInput, AssignmentFor(insideSource, insideInput) ??
-                pager.Inside ?? OperatorSession.DefaultInside);
+                role?.Inside ?? OperatorSession.DefaultInside);
             ShowMapping(outsideSource, outsideInput, AssignmentFor(outsideSource, outsideInput) ??
-                pager.Outside ?? OperatorSession.DefaultOutside);
+                role?.Outside ?? OperatorSession.DefaultOutside);
         }
     }
 
@@ -561,19 +657,39 @@ internal sealed class MainWindow : Form
             {
                 Connection.Connected => "Verbunden", Connection.Delayed => "Delayed", _ => "Getrennt"
             };
-            string[] values = [status.Name, session.IsTesting(status.Id) ? "Simulation" : "Mixer",
+            if (deviceConnections.GetValueOrDefault(status.Id) != status.Connection)
+            {
+                core.Diagnostics.Add(status.Name, "Stick-Verbindung", $"{connection} · {Transport.Name(status.Transport)}, letzte Telemetrie vor {status.TelemetryAgeMs?.ToString() ?? "—"} ms, " +
+                    $"RTT {status.Rtt?.ToString() ?? "—"} ms, RSSI {status.Rssi?.ToString() ?? "—"} dBm");
+                deviceConnections[status.Id] = status.Connection;
+            }
+            string[] values = [status.Name, (session.IsTesting(status.Id) ? "TEST" : "") +
+                (session.IsTesting(status.Id) ? " · " : "") + Transport.Name(status.Transport),
                 LayerStatus(status.Online, status.View.Inside, status.View.InsideSource),
                 LayerStatus(status.Online, status.View.Outside, status.View.OutsideSource),
                 connection, status.Rssi is int rssi ? $"{WifiBars(rssi)}/4 · {rssi} dBm" : "—",
                 status.Rtt is int rtt ? $"{rtt} ms" : "—", status.Online && status.Battery is int battery ? $"{battery} %" : "—",
-                status.PreviewReceived ? "Bestätigt" : "—"];
+                status.PreviewReceived ? "Bestätigt" : "—", OperatorSession.Delivery(status),
+                status.Firmware?.ShortVersion ?? "—"];
             for (int i = 0; i < values.Length; i++)
                 if (!Equals(row.Cells[i].Value, values[i])) row.Cells[i].Value = values[i];
             row.Cells[4].Style.ForeColor = status.Connection switch
             {
                 Connection.Connected => Color.DarkGreen, Connection.Delayed => Color.SaddleBrown, _ => Color.DimGray
             };
+            row.Cells["Firmware"].ToolTipText = status.Firmware?.Description ?? "Firmware noch nicht gemeldet.";
         }
+        ShowSelectedFirmware();
+    }
+
+    private void ShowSelectedFirmware()
+    {
+        var status = SelectedIds() is [var id] ? core.Statuses().FirstOrDefault(pager => pager.Id == id) : null;
+        string text = status is null ? "" : status.Firmware is { } firmware
+            ? (status.Online || status.Settings is not null ? "" : "Zuletzt erkannt · ") + firmware.Description
+            : "Firmware noch nicht gemeldet. Die genaue Version lässt sich per USB ablesen.";
+        if (selectedFirmware.Text != text) selectedFirmware.Text = text;
+        selectedFirmware.Visible = text.Length != 0;
     }
 
     private static string LayerStatus(bool online, int state, string source) =>
@@ -583,11 +699,15 @@ internal sealed class MainWindow : Form
 
     private void ScanPorts()
     {
-        string? previous = ports.SelectedItem as string;
-        ports.Items.Clear();
-        ports.Items.AddRange(SerialPort.GetPortNames().Order().ToArray());
-        if (previous is not null && ports.Items.Contains(previous)) ports.SelectedItem = previous;
-        else if (ports.Items.Count == 1) ports.SelectedIndex = 0;
+        var found = SerialPort.GetPortNames().Order().ToArray();
+        foreach (var picker in new[] { ports, basePort })
+        {
+            string? previous = picker.SelectedItem as string;
+            picker.Items.Clear();
+            picker.Items.AddRange(found);
+            if (previous is not null && picker.Items.Contains(previous)) picker.SelectedItem = previous;
+            else if (picker.Items.Count == 1) picker.SelectedIndex = 0;
+        }
     }
 
     private static IEnumerable<string> FindAddresses() => NetworkInterface.GetAllNetworkInterfaces()
@@ -624,7 +744,7 @@ internal sealed class MainWindow : Form
         return panel;
     }
 
-    private static TableLayoutPanel Grid(TabPage page, string title)
+    private static TableLayoutPanel Grid(Control page, string title)
     {
         var grid = new TableLayoutPanel
         {
@@ -635,9 +755,12 @@ internal sealed class MainWindow : Form
         grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         grid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         page.Controls.Add(grid);
-        Full(grid, new Label { Text = title, AutoSize = true, Font = new Font("Segoe UI", 14, FontStyle.Bold) });
+        Heading(grid, title);
         return grid;
     }
+
+    private static void Heading(TableLayoutPanel grid, string title) =>
+        Full(grid, new Label { Text = title, AutoSize = true, Font = new Font("Segoe UI", 14, FontStyle.Bold) });
 
     private static void Full(TableLayoutPanel grid, Control control)
     {

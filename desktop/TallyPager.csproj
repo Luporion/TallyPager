@@ -5,9 +5,10 @@
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <Version>0.4.0</Version>
+    <Version>0.6.3</Version>
   </PropertyGroup>
   <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
     <PackageReference Include="System.IO.Ports" Version="10.0.9" />
     <PackageReference Include="LibAtem" Version="1.0.0" />
     <PackageReference Include="log4net" Version="3.6.0" />
