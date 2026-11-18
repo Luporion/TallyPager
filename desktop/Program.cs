@@ -65,7 +65,7 @@ internal sealed partial class MainWindow : Form
     private readonly TextBox chat = new() { MaxLength = 68 };
     private readonly TextBox next = new() { MaxLength = 38 };
     private readonly TextBox atemHost = new() { PlaceholderText = "ATEM-IP-Adresse" };
-    private readonly TextBox vmixHost = new() { PlaceholderText = "vMix-IP oder Hostname" };
+    private readonly TextBox vmixHost = new() { PlaceholderText = "vMix-IP, Hostname oder Web-URL" };
     private readonly TextBox arbiterHost = new() { PlaceholderText = "Host oder Host:4455" };
     private readonly ComboBox insideSource = Choices();
     private readonly ComboBox outsideSource = Choices();
@@ -84,6 +84,7 @@ internal sealed partial class MainWindow : Form
     private readonly TabPage simulation = new("Simulation");
     private readonly TabPage setup = new("Stick einrichten/verwalten");
     private readonly Label selectedFirmware = Notice();
+    private readonly PagerPreview pagerPreview = new() { Visible = false };
     private readonly System.Windows.Forms.Timer timer = new() { Interval = 25 };
     private AtemSource? atem;
     private VmixSource? vmix;
@@ -186,6 +187,10 @@ internal sealed partial class MainWindow : Form
             Action("Chat und Next leeren", (_, _) => SendText(true, true, clear: true))));
         Full(grid, chatStatus);
         Full(grid, requireManualAck);
+        var showPreview = new CheckBox { Text = "Stick-Vorschau anzeigen", AutoSize = true };
+        showPreview.CheckedChanged += (_, _) => pagerPreview.Visible = showPreview.Checked;
+        Full(grid, showPreview);
+        Full(grid, pagerPreview);
         Row(grid, "Schnelltext", favorite, InlineButtons(Action("Übernehmen", (_, _) => LoadQuick()),
             Action("Direkt senden", (_, _) =>
             {
@@ -214,9 +219,11 @@ internal sealed partial class MainWindow : Form
         insideSource.SelectionChangeCommitted += (_, _) => ChangeMixer(insideSource, insideInput);
         outsideSource.SelectionChangeCommitted += (_, _) => ChangeMixer(outsideSource, outsideInput);
         Row(grid, "Innen · Quelle", insideSource);
-        Row(grid, "Innen · Eingang", insideInput);
+        Row(grid, "Innen - Input", insideInput);
         Row(grid, "Außen · Quelle", outsideSource);
-        Row(grid, "Außen · Eingang", outsideInput);
+        Row(grid, "Außen - Input", outsideInput);
+        insideInput.TextUpdate += (_, _) => FilterVmixInputs(insideSource, insideInput);
+        outsideInput.TextUpdate += (_, _) => FilterVmixInputs(outsideSource, outsideInput);
         Full(grid, Buttons(Action("Innen und außen tauschen", (_, _) => Swap()),
             Action("Zuordnung speichern", (_, _) => SaveMapping())));
         Full(grid, mappingStatus);
@@ -272,17 +279,23 @@ internal sealed partial class MainWindow : Form
 
         var grid = Grid(usb, "USB-Einrichtung");
         Row(grid, "USB-Anschluss", ports, Action("Ports suchen", (_, _) => ScanPorts()));
+        Full(grid, usbPortStatus);
         ports.SelectedIndexChanged += (_, _) => usbFirmware.Text = "";
-        Full(grid, Buttons(Action("Firmware lesen", async (_, _) => await InspectUsb(ports, usbFirmware))));
+        Full(grid, Buttons(Action("Firmware lesen", async (_, _) => await InspectUsb(ports, usbFirmware)),
+            Action("Stick auslesen", async (_, _) => await InspectDeviceSettings())));
         Full(grid, usbFirmware);
         Row(grid, "Firmwarepaket", firmware, Action("ZIP auswählen", (_, _) => SelectFirmware()));
         Row(grid, "Funkmodus", pagerTransport);
         Row(grid, "Adresse dieses PCs", addresses);
         Row(grid, "Name des Sticks", pagerName);
         Row(grid, "WLAN-Name", ssid);
-        Row(grid, "WLAN-Passwort", password);
+        Row(grid, "WLAN-Passwort", password, Reveal(password));
         Row(grid, "Adresse der Funkbasis", gatewayAddress);
         Row(grid, "ESP-NOW-Kanal", pagerChannel);
+        Row(grid, "Geräteprofil am Stick", deviceSlot);
+        AddSetupLibrary(grid);
+        Full(grid, keepWifi);
+        Full(grid, incrementName);
         Full(grid, Buttons(Action("Stick einrichten", async (_, _) => await Provision()),
             Action("Firmware aktualisieren", async (_, _) => await UpdateUsbFirmware())));
         Full(grid, usbStatus);
@@ -339,18 +352,25 @@ internal sealed partial class MainWindow : Form
                 usbStatus.Text = $"Firmware {current.Version} bietet die USB-Einrichtung für {Transport.Name(mode)} nicht an.";
                 return;
             }
+            int? slot = current.Firmware.Supports("device-slots") ? (int)deviceSlot.Value - 1 : null;
+            if (slot is null && deviceSlot.Value != 1)
+            {
+                usbStatus.Text = "Weitere Geräteprofile sind ab Firmware 0.7.0 verfügbar.";
+                return;
+            }
             var pager = core.Prepare(current.Id, name);
             core.Save(pager);
             usbStatus.Text = "Schreibe Einstellungen und prüfe den Neustart …";
             var result = await Task.Run(() => PagerUsb.Configure(port, pager, host, network, secret,
-                mode, IsEspNow(mode) ? gateway : "", channel));
+                mode, IsEspNow(mode) ? gateway : "", channel, slot));
             if (pager.ConfiguredTransport != result.Mode)
                 core.Save(pager with { ConfiguredTransport = result.Mode });
             ShowUsbFirmware(result, usbFirmware);
             if (profiles.RoleFor(pager.Id) is null && !profiles.Unbound(profiles.Active).Any())
                 profiles.Bind(pager.Id, new(Guid.NewGuid(), pager.Name, pager.Inside, pager.Outside));
             RefreshProfileChoices();
-            password.Clear();
+            if (!keepWifi.Checked) password.Clear();
+            if (incrementName.Checked) pagerName.Text = NextDeviceName(name);
             usbStatus.Text = mode != "udp" ? $"Funkmodus {Transport.Name(result.Mode)} am Stick gespeichert." :
                 result.Wifi ? $"USB-Einrichtung bestätigt. Stick-IP {result.Ip}." :
                 "USB-Einrichtung bestätigt. Der Stick versucht, sich mit dem WLAN zu verbinden.";
@@ -396,12 +416,12 @@ internal sealed partial class MainWindow : Form
             vmix.Dispose();
             vmix = null;
         }
-        else if (Uri.CheckHostName(vmixHost.Text.Trim()) != UriHostNameType.Unknown)
+        else if (VmixSource.ValidAddress(vmixHost.Text.Trim()))
         {
             if (!ProfileAction(() => StoreSources(profiles.Active.Sources with { Vmix = vmixHost.Text.Trim(), VmixEnabled = true }), vmixStatus)) return;
             vmix = new VmixSource(vmixHost.Text.Trim());
         }
-        else { vmixStatus.Text = "Bitte die vMix-IP oder den Rechnernamen eingeben."; return; }
+        else { vmixStatus.Text = "Bitte die vMix-IP, den Rechnernamen oder die Web-URL eingeben."; return; }
         button.Text = vmix is null ? "Verbinden" : "Trennen";
         vmixStatus.Text = vmix?.State.Status ?? MixerState.Off.Status;
     }
@@ -498,7 +518,23 @@ internal sealed partial class MainWindow : Form
         else input.Text = oldText;
     }
 
-    private static Assignment? AssignmentFor(ComboBox source, ComboBox input)
+    private void FilterVmixInputs(ComboBox source, ComboBox input)
+    {
+        if (source.SelectedIndex != (int)MixerKind.Vmix) return;
+        string text = input.Text;
+        int caret = input.SelectionStart;
+        var matches = lastVmix.Inputs.Where(item => item.ToString().Contains(text.Trim(), StringComparison.OrdinalIgnoreCase)).ToArray();
+        input.BeginUpdate();
+        input.Items.Clear();
+        input.Items.AddRange(matches);
+        input.Text = text;
+        input.EndUpdate();
+        input.DroppedDown = matches.Length > 0;
+        input.SelectionStart = caret;
+        input.SelectionLength = 0;
+    }
+
+    private Assignment? AssignmentFor(ComboBox source, ComboBox input)
     {
         var mixer = (MixerKind)Math.Max(0, source.SelectedIndex);
         if (mixer == MixerKind.Off) return new(mixer, 0);
@@ -506,9 +542,15 @@ internal sealed partial class MainWindow : Form
         if (input.Tag is ValueTuple<Assignment, string> retained && retained.Item1.Mixer == mixer &&
             input.Text == retained.Item2) return retained.Item1;
         if (mixer is MixerKind.Arbiter or MixerKind.ArbiterAtem or MixerKind.ArbiterVmix) return null;
+        if (mixer == MixerKind.Vmix && !int.TryParse(input.Text, out _))
+        {
+            var named = lastVmix.Inputs.Where(value => value.Name.Equals(input.Text.Trim(), StringComparison.OrdinalIgnoreCase)).ToArray();
+            return named is [var match] ? new(mixer, match.Number, match.Key) : null;
+        }
         if (!int.TryParse(input.Text, out int number) ||
             (mixer == MixerKind.Vmix ? number is < 1 or > 1000 : number is < 0 or > 65535)) return null;
-        var listed = input.Items.OfType<MixerInput>().FirstOrDefault(value => value.Number == number);
+        var listed = (mixer == MixerKind.Vmix ? lastVmix.Inputs : input.Items.OfType<MixerInput>())
+            .FirstOrDefault(value => value.Number == number);
         return new(mixer, number, listed?.Key);
     }
 
@@ -609,6 +651,7 @@ internal sealed partial class MainWindow : Form
             core.Tick();
             if (now - lastUi < 250) return;
             lastUi = now;
+            if (now - lastPortScan >= 1000) ScanPorts();
             UpdateMixerUi(a, v, ta);
             RefreshRows();
             RefreshDiagnostics(v);
@@ -632,10 +675,12 @@ internal sealed partial class MainWindow : Form
         if (listChanged && mappingId is { } id)
         {
             var role = profiles.RoleFor(id);
-            ShowMapping(insideSource, insideInput, AssignmentFor(insideSource, insideInput) ??
-                role?.Inside ?? OperatorSession.DefaultInside);
-            ShowMapping(outsideSource, outsideInput, AssignmentFor(outsideSource, outsideInput) ??
-                role?.Outside ?? OperatorSession.DefaultOutside);
+            if (!insideInput.Focused && !insideInput.DroppedDown)
+                ShowMapping(insideSource, insideInput, AssignmentFor(insideSource, insideInput) ??
+                    role?.Inside ?? OperatorSession.DefaultInside);
+            if (!outsideInput.Focused && !outsideInput.DroppedDown)
+                ShowMapping(outsideSource, outsideInput, AssignmentFor(outsideSource, outsideInput) ??
+                    role?.Outside ?? OperatorSession.DefaultOutside);
         }
     }
 
@@ -685,6 +730,7 @@ internal sealed partial class MainWindow : Form
     private void ShowSelectedFirmware()
     {
         var status = SelectedIds() is [var id] ? core.Statuses().FirstOrDefault(pager => pager.Id == id) : null;
+        pagerPreview.Update(status);
         string text = status is null ? "" : status.Firmware is { } firmware
             ? (status.Online || status.Settings is not null ? "" : "Zuletzt erkannt · ") + firmware.Description
             : "Firmware noch nicht gemeldet. Die genaue Version lässt sich per USB ablesen.";
@@ -699,7 +745,14 @@ internal sealed partial class MainWindow : Form
 
     private void ScanPorts()
     {
+        lastPortScan = Environment.TickCount64;
         var found = SerialPort.GetPortNames().Order().ToArray();
+        if (knownPorts.SequenceEqual(found)) return;
+        var removed = knownPorts.Except(found).ToArray();
+        var added = found.Except(knownPorts).ToArray();
+        usbPortStatus.Text = string.Join(" · ", added.Select(port => $"{port} verbunden")
+            .Concat(removed.Select(port => $"{port} getrennt")));
+        knownPorts = found;
         foreach (var picker in new[] { ports, basePort })
         {
             string? previous = picker.SelectedItem as string;
@@ -707,6 +760,7 @@ internal sealed partial class MainWindow : Form
             picker.Items.AddRange(found);
             if (previous is not null && picker.Items.Contains(previous)) picker.SelectedItem = previous;
             else if (picker.Items.Count == 1) picker.SelectedIndex = 0;
+            else if (added is [var onlyNew]) picker.SelectedItem = onlyNew;
         }
     }
 

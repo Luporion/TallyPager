@@ -67,6 +67,7 @@ internal sealed class PilotCore : IDisposable
         public uint PreviewSequence { get; set; }
         public long SeenAt { get; set; } = -6000;
         public long HandshakeAt { get; set; } = -6000;
+        public long ClockAt { get; set; } = -60000;
         public int? Battery { get; set; }
         public int? Rssi { get; set; }
         public int? Rtt { get; set; }
@@ -236,7 +237,17 @@ internal sealed class PilotCore : IDisposable
         foreach (var link in devices.Values)
         {
             RetryConfiguration(link, now);
-            if (now - Math.Max(link.SeenAt, link.HandshakeAt) < 5000) SendState(link);
+            if (now - Math.Max(link.SeenAt, link.HandshakeAt) < 5000)
+            {
+                SendState(link);
+                if (!link.Paused && link.Firmware?.Supports("clock") == true &&
+                    link.Active is { } active && now - link.ClockAt >= 15000)
+                {
+                    int seconds = (int)DateTime.Now.TimeOfDay.TotalSeconds;
+                    Send(link, active.Endpoint, FormattableString.Invariant($"TP1|clock|{link.Pager.Id}|{active.Session}|{seconds}"));
+                    link.ClockAt = now;
+                }
+            }
         }
     }
 
@@ -373,6 +384,7 @@ internal sealed class PilotCore : IDisposable
             link.ConfigCounter = 0;
             link.Transport = source.Bridge?.Mode ?? "udp";
             link.HandshakeAt = now;
+            link.ClockAt = -60000;
             link.SeenAt = -6000;
             link.PreviewSequence = SendState(link);
         }

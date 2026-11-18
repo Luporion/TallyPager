@@ -172,7 +172,7 @@ internal sealed class ProfileStore
                     .Any(value => value is null || value.Length > 256 || value.Any(char.IsControl)) ||
                 (profile.Sources.Atem.Length > 0 && (!System.Net.IPAddress.TryParse(profile.Sources.Atem, out var ip) ||
                     ip.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)) ||
-                (profile.Sources.Vmix.Length > 0 && Uri.CheckHostName(profile.Sources.Vmix) == UriHostNameType.Unknown) ||
+                (profile.Sources.Vmix.Length > 0 && !VmixSource.ValidAddress(profile.Sources.Vmix)) ||
                 (profile.Sources.Arbiter.Length > 0 && TallyArbiterSource.Endpoint(profile.Sources.Arbiter) is null))
                 throw new InvalidDataException("Ungültige Profilfelder.");
             if (roles.Any(r => r is null || !NameOk(r.Name) || !AssignmentOk(r.Inside) ||

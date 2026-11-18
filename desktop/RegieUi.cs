@@ -163,9 +163,9 @@ internal sealed partial class MainWindow
         if (addresses == profiles.Active.Sources) return;
         if (addresses.Atem.Length > 0 && (!IPAddress.TryParse(addresses.Atem, out var ip) ||
                 ip.AddressFamily != AddressFamily.InterNetwork) ||
-            addresses.Vmix.Length > 0 && Uri.CheckHostName(addresses.Vmix) == UriHostNameType.Unknown ||
+            addresses.Vmix.Length > 0 && !VmixSource.ValidAddress(addresses.Vmix) ||
             addresses.Arbiter.Length > 0 && TallyArbiterSource.Endpoint(addresses.Arbiter) is null)
-            throw new InvalidDataException("ATEM-IPv4, vMix-Hostname oder Tally-Arbiter-Adresse prüfen.");
+            throw new InvalidDataException("ATEM-IPv4, vMix-Adresse oder Tally-Arbiter-Adresse prüfen.");
         profiles.Update(profiles.Active with { Sources = addresses });
         if (profileChoice.Items.Count != 0) RefreshProfileChoices();
     }
@@ -399,7 +399,7 @@ internal sealed partial class MainWindow
             role.Outside ?? OperatorSession.DefaultOutside }.Where(assignment => assignment.Mixer == MixerKind.Vmix)
             .Where(assignment => OperatorSession.FindInput(assignment, MixerState.Off, v, null) is null)
             .Select(assignment => $"{role.Name} · Eingang {assignment.Input}")).Distinct().ToArray();
-        string mapping = v.Status == "Verbunden" && missing.Length > 0
+        string mapping = v.Status.StartsWith("Verbunden", StringComparison.Ordinal) && missing.Length > 0
             ? "vMix erreichbar. Gespeicherte Eingänge fehlen: " + string.Join(", ", missing) : "";
         if (vmixMapping.Text != mapping)
         {

@@ -11,14 +11,16 @@ namespace TallyPager;
 internal sealed record UsbStatus(string Version, string Id, bool Configured, bool Wifi, string Ip,
     bool Core, int Inside, int Outside, string Cue, string Next, string Mode = "udp",
     bool BaseRole = false, string RadioAddress = "", int Channel = 6, bool RadioReady = false,
-    string[]? Features = null)
+    string[]? Features = null, int Slot = 0)
 {
     public FirmwareInfo? Firmware => FirmwareInfo.Read(Version, Features);
 }
+internal sealed record UsbSettings(string Id, string Name, string Host, string Ssid, string Password,
+    string Mode, string Gateway, int Channel, int Slot);
 
 internal static class PagerUsb
 {
-    public const string Version = "0.6.3";
+    public const string Version = "0.7.0";
     public const string FirmwareFileName = "TallyPager-Firmware-M5StickC-Plus2-" + Version + ".zip";
     private const string StatusPrefix = "TP ";
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
@@ -58,32 +60,53 @@ internal static class PagerUsb
     }
 
     public static UsbStatus Configure(string port, Pager pager, string host, string ssid, string password,
-        string mode = "udp", string gateway = "", int channel = 6)
+        string mode = "udp", string gateway = "", int channel = 6, int? slot = null)
     {
         using (var serial = Open(port))
         {
             var current = ReadStatus(serial, TimeSpan.FromSeconds(4));
             if (current.Id != pager.Id) throw new InvalidOperationException("Am USB-Port antwortet inzwischen ein anderer Stick.");
-            serial.WriteLine(ConfigCommand(current, pager, host, ssid, password, mode, gateway, channel));
+            serial.WriteLine(ConfigCommand(current, pager, host, ssid, password, mode, gateway, channel, slot));
             if (ReadReply(serial, TimeSpan.FromSeconds(4)) != "TP OK")
                 throw new InvalidOperationException("Der Stick hat die Einstellungen nicht bestätigt.");
         }
         Thread.Sleep(1400);
         var status = ReadStatus(port, TimeSpan.FromSeconds(8));
-        return status is { Configured: true, BaseRole: false } && status.Id == pager.Id && status.Mode == mode ? status :
+        return status is { Configured: true, BaseRole: false } && status.Id == pager.Id && status.Mode == mode &&
+            (slot is null || status.Slot == slot) ? status :
             throw new InvalidOperationException("Die Konfiguration konnte nach dem Neustart nicht bestätigt werden.");
     }
 
     internal static string ConfigCommand(UsbStatus current, Pager pager, string host, string ssid, string password,
-        string mode, string gateway, int channel)
+        string mode, string gateway, int channel, int? slot = null)
     {
         var firmware = current.Firmware;
         if (firmware?.AllowsUsbMode(mode) != true || current.BaseRole && !firmware.Supports(FirmwareInfo.RadioBase))
             throw new InvalidOperationException($"Firmware {current.Version} unterstützt die gewählte USB-Einrichtung nicht.");
-        object payload = firmware.Supports(FirmwareInfo.RadioBase) || mode != "udp" ?
+        if (slot is not null && (slot is < 0 or > 3 || !firmware.Supports("device-slots")))
+            throw new InvalidOperationException("Firmware unterstützt dieses Geräteprofil nicht.");
+        object payload = slot.HasValue ? new { host, pager.Name, ssid, password, pager.Key, mode, gateway, channel, slot } :
+            firmware.Supports(FirmwareInfo.RadioBase) || mode != "udp" ?
             new { host, pager.Name, ssid, password, pager.Key, mode, gateway, channel } :
             new { host, pager.Name, ssid, password, pager.Key };
         return "TP CONFIG " + JsonSerializer.Serialize(payload, Json);
+    }
+
+    public static UsbSettings ReadSettings(string port)
+    {
+        using var serial = Open(port);
+        var current = ReadStatus(serial, TimeSpan.FromSeconds(4));
+        if (current.Firmware?.Supports("usb-read-settings") != true)
+            throw new InvalidOperationException("Stick-Einstellungen lassen sich ab Firmware 0.7.0 per USB auslesen.");
+        serial.WriteLine("TP READ SETTINGS");
+        const string prefix = "TP SETTINGS ";
+        var line = ReadReply(serial, TimeSpan.FromSeconds(4), prefix);
+        if (line?.StartsWith(prefix, StringComparison.Ordinal) == true && line.Length < 4096)
+        {
+            var data = JsonSerializer.Deserialize<UsbSettings>(line[prefix.Length..], Json);
+            if (data?.Id == current.Id) return data;
+        }
+        throw new InvalidOperationException("Der Stick hat keine gespeicherten Pager-Einstellungen gemeldet.");
     }
 
     public static UsbStatus ConfigureBase(string port, string id, string mode, int channel)
@@ -245,7 +268,7 @@ internal static class PagerUsb
         catch { serial.Dispose(); throw; }
     }
 
-    private static string? ReadReply(SerialPort port, TimeSpan timeout)
+    private static string? ReadReply(SerialPort port, TimeSpan timeout, string? prefix = null)
     {
         var timer = Stopwatch.StartNew();
         while (timer.Elapsed < timeout)
@@ -253,7 +276,8 @@ internal static class PagerUsb
             try
             {
                 string line = port.ReadLine().Trim();
-                if (line.StartsWith(StatusPrefix, StringComparison.Ordinal) &&
+                if ((prefix is null || line.StartsWith(prefix, StringComparison.Ordinal) || line == "TP ERROR read") &&
+                    line.StartsWith(StatusPrefix, StringComparison.Ordinal) &&
                     !line.StartsWith("TP LINK ", StringComparison.Ordinal)) return line;
             }
             catch (TimeoutException) { }

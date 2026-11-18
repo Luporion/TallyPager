@@ -52,6 +52,18 @@ internal sealed class RadioBridge : IRadioBridge
     public bool Send(string address, string payload) => !closed && failure is null &&
         outbound.Writer.TryWrite(Prefix + address + " " + payload);
 
+    public void SendBaseView(PagerStatus[] pagers)
+    {
+        if (closed || failure is not null || Status.Firmware?.Supports("base-preview") != true) return;
+        var rows = pagers.Where(p => p.Transport == Mode).OrderByDescending(p => p.Online).Take(4).Select(pager => new
+        {
+            name = pager.Name[..Math.Min(20, pager.Name.Length)],
+            inside = pager.Online ? pager.View.Inside : 0,
+            outside = pager.Online ? pager.View.Outside : 0
+        });
+        outbound.Writer.TryWrite("TP BASEVIEW " + System.Text.Json.JsonSerializer.Serialize(rows));
+    }
+
     private async Task Pump()
     {
         const int limit = 921;

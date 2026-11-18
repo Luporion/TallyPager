@@ -18,7 +18,8 @@ constexpr uint32_t staleAfter = 1500;
 constexpr size_t maxPacket = 900;
 constexpr char hexDigits[] = "0123456789abcdef";
 constexpr const char* firmwareFeatures[] = {"usb-config", "chat-ack", "link-stats", "diagnostics",
-    "wifi-config", "wifi-discovery", "radio-base", "espnow", "espnow-lr", "ble"};
+    "wifi-config", "wifi-discovery", "radio-base", "espnow", "espnow-lr", "ble",
+    "usb-read-settings", "clock", "device-slots", "base-preview"};
 WiFiUDP udp, management;
 IPAddress core;
 String deviceId, name, ssid, password, nonce, session, cue, next, serialLine;
@@ -51,6 +52,14 @@ uint32_t connectedAt = 0;
 int rtt = -1;
 bool configured = false, udpReady = false, diagnostics = false, dirty = true, serialOverflow = false;
 bool testMode = false;
+int activeSlot = 0, chosenSlot = -1;
+uint32_t menuHeld = 0, menuTouched = 0, clockAt = 0, clockSeconds = 0;
+int lastMinute = -1;
+bool clockSynced = false, menuArmed = false, menuAttempted = false;
+struct BaseLine { String name; uint8_t inside = 0, outside = 0; };
+BaseLine baseLines[4];
+size_t baseCount = 0;
+uint32_t baseViewAt = 0;
 
 void reportConfig();
 void handleConfig(String* fields, size_t count, uint32_t now, uint32_t& lastCounter);
@@ -201,6 +210,18 @@ void receive(uint32_t now) {
       dirty = true;
     }
     if (session.isEmpty() || count < 5 || fields[3] != session) continue;
+    if (count == 5 && fields[1] == "clock") {
+      char* end = nullptr;
+      const char* value = fields[4].c_str();
+      unsigned long seconds = strtoul(value, &end, 10);
+      if (end != value && !*end && seconds < 86400) {
+        clockSeconds = seconds;
+        clockAt = now;
+        clockSynced = true;
+        dirty = true;
+      }
+      continue;
+    }
     if (mode == "udp" && fields[1] == "cfg" && sequence) {
       handleConfig(fields, count, now, configCounter);
       continue;
@@ -318,7 +339,9 @@ void network(uint32_t now) {
 
 bool radioMode(const String& value) { return value == "espnow" || value == "espnow-lr" || value == "ble"; }
 
-bool settings(JsonDocument& doc, bool persist) {
+String slotKey(int slot) { return "slot" + String(slot); }
+
+bool settings(JsonDocument& doc, bool persist, bool apply = true) {
   String host = doc["host"] | "";
   String deviceName = doc["name"] | "";
   String networkName = doc["ssid"] | "";
@@ -327,34 +350,45 @@ bool settings(JsonDocument& doc, bool persist) {
   String transport = doc["mode"] | "udp";
   String gateway = doc["gateway"] | "";
   int channel = doc["channel"] | 6;
+  int slot = doc["slot"] | activeSlot;
   uint8_t remote[6]{};
   IPAddress address;
   uint8_t bytes[32];
   if ((transport == "udp" ? !address.fromString(host.c_str()) || static_cast<uint32_t>(address) == 0 :
        !radioMode(transport) || (transport != "ble" && !radio::parseAddress(gateway, remote))) ||
-      channel < 1 || channel > 13 ||
+      channel < 1 || channel > 13 || slot < 0 || slot >= 4 ||
       !unhex(secret, bytes, sizeof(bytes)) || deviceName.isEmpty() || deviceName.length() > 48 ||
       networkName.length() > 32 || networkPassword.length() > 64 ||
       (networkName.isEmpty() && !networkPassword.isEmpty())) return false;
   if (persist) {
     Preferences prefs;
     if (!prefs.begin("tallypilot", false)) return false;
+    String savedConfig = prefs.getString("config", "");
+    if (savedConfig.length() && !prefs.isKey(slotKey(activeSlot).c_str()) &&
+        prefs.putString(slotKey(activeSlot).c_str(), savedConfig) != savedConfig.length()) {
+      prefs.end();
+      return false;
+    }
     // An empty WLAN form keeps the credentials used by the current firmware.
     // This also preserves the pilot's profile when upgrading from 0.2.
     if (networkName.isEmpty()) {
       JsonDocument previous;
-      if (!deserializeJson(previous, prefs.getString("config", ""))) {
+      String priorSlot = prefs.getString(slotKey(slot).c_str(), savedConfig);
+      if (!deserializeJson(previous, priorSlot)) {
         doc["ssid"] = String(previous["ssid"] | "");
         doc["password"] = String(previous["password"] | "");
       }
     }
     String encoded;
+    doc["slot"] = slot;
     serializeJson(doc, encoded);
-    bool saved = prefs.putString("config", encoded) == encoded.length();
+    bool saved = prefs.putString(slotKey(slot).c_str(), encoded) == encoded.length() &&
+        prefs.putString("config", encoded) == encoded.length();
     if (saved && prefs.isKey("base")) saved = prefs.remove("base");
     prefs.end();
     return saved;
   }
+  if (!apply) return true;
   memcpy(key, bytes, sizeof(bytes));
   core = address;
   name = deviceName;
@@ -364,6 +398,7 @@ bool settings(JsonDocument& doc, bool persist) {
   baseMac = gateway;
   memcpy(gatewayAddress, remote, 6);
   radioChannel = channel;
+  activeSlot = slot;
   return true;
 }
 
@@ -599,9 +634,54 @@ void status() {
   doc["radioAddress"] = radioMac;
   doc["channel"] = radioChannel;
   doc["radioReady"] = radio::ready();
+  doc["slot"] = activeSlot;
   Serial.print("TP ");
   serializeJson(doc, Serial);
   Serial.println();
+}
+
+void readUsbSettings() {
+  Preferences prefs;
+  if (!prefs.begin("tallypilot", true)) { Serial.println("TP ERROR read"); return; }
+  String encoded = prefs.getString("config", "");
+  prefs.end();
+  JsonDocument config, reply;
+  if (deserializeJson(config, encoded)) { Serial.println("TP ERROR read"); return; }
+  reply["id"] = deviceId;
+  for (const char* field : {"name", "host", "ssid", "password", "mode", "gateway"}) {
+    const char* value = config[field] | "";
+    reply[field] = value;
+  }
+  if (String(reply["ssid"] | "").isEmpty() && mode == "udp") {
+    wifi_config_t station{};
+    if (esp_wifi_get_config(WIFI_IF_STA, &station) == ESP_OK && station.sta.ssid[0]) {
+      char actualSsid[33]{}, actualPassword[65]{};
+      memcpy(actualSsid, station.sta.ssid, sizeof(station.sta.ssid));
+      memcpy(actualPassword, station.sta.password, sizeof(station.sta.password));
+      reply["ssid"] = String(actualSsid);
+      reply["password"] = String(actualPassword);
+    }
+  }
+  reply["channel"] = config["channel"] | 6;
+  reply["slot"] = config["slot"] | 0;
+  Serial.print("TP SETTINGS ");
+  serializeJson(reply, Serial);
+  Serial.println();
+}
+
+void readBaseView(const char* payload) {
+  JsonDocument view;
+  if (deserializeJson(view, payload) || !view.is<JsonArray>()) return;
+  baseCount = 0;
+  for (JsonObject row : view.as<JsonArray>()) {
+    if (baseCount == 4) break;
+    auto& line = baseLines[baseCount++];
+    line.name = String(row["name"] | "").substring(0, 24);
+    line.inside = constrain(row["inside"] | 0, 0, 3);
+    line.outside = constrain(row["outside"] | 0, 0, 3);
+  }
+  baseViewAt = millis();
+  dirty = true;
 }
 
 void serialInput() {
@@ -614,6 +694,8 @@ void serialInput() {
       continue;
     }
     if (!serialOverflow && serialLine == "TP STATUS") status();
+    if (!serialOverflow && serialLine == "TP READ SETTINGS") readUsbSettings();
+    if (!serialOverflow && baseRole && serialLine.startsWith("TP BASEVIEW ")) readBaseView(serialLine.c_str() + 12);
     if (!serialOverflow && serialLine.startsWith("TP CONFIG ")) {
       JsonDocument doc;
       bool ok = !deserializeJson(doc, serialLine.c_str() + 10) && settings(doc, true);
@@ -674,13 +756,37 @@ void draw() {
   display.setTextDatum(top_left);
   display.setTextSize(1);
   display.startWrite();
-  if (baseRole) {
+  if (chosenSlot >= 0) {
+    display.fillScreen(TFT_BLACK);
+    display.setTextColor(TFT_WHITE);
+    display.drawString("Funk- und WLAN-Profil", 5, 12);
+    Preferences prefs;
+    if (prefs.begin("tallypilot", true)) {
+      JsonDocument selected;
+      if (!deserializeJson(selected, prefs.getString(slotKey(chosenSlot).c_str(), ""))) {
+        display.drawString(String(chosenSlot + 1) + "  " + String(selected["mode"] | "udp"), 5, 42);
+        display.drawString(displayText(String(selected["ssid"] | "")).substring(0, 36), 5, 59);
+      }
+      prefs.end();
+    }
+    display.drawString("A: Weiter     B: Aktivieren", 5, 94);
+  } else if (baseRole) {
     display.fillScreen(TFT_BLACK);
     display.setTextColor(TFT_WHITE);
     display.drawString("TallyPager Funkbasis", 5, 6);
     display.drawString(mode + "  Kanal " + String(radioChannel), 5, 28);
-    display.drawString("Adresse: " + radioMac, 5, 50);
-    display.drawString(radio::ready() ? "Bereit fuer Windows" : "Funkstart fehlgeschlagen", 5, 74);
+    if (baseCount && millis() - baseViewAt < 3500) {
+      for (size_t i = 0; i < baseCount; ++i) {
+        int y = 48 + i * 20;
+        auto& row = baseLines[i];
+        display.fillRect(6, y, 14, 14, colors[row.outside]);
+        display.fillRect(9, y + 3, 8, 8, colors[row.inside]);
+        display.drawString(displayText(row.name).substring(0, 31), 25, y + 3);
+      }
+    } else {
+      display.drawString("Adresse: " + radioMac, 5, 50);
+      display.drawString(radio::ready() ? "Bereit fuer Windows" : "Funkstart fehlgeschlagen", 5, 74);
+    }
   } else if (diagnostics) {
     display.fillScreen(TFT_BLACK);
     display.setTextColor(TFT_WHITE);
@@ -716,6 +822,11 @@ void draw() {
     display.drawString(connection, mode == "udp" ? 148 : 128, 5);
     display.setTextColor(TFT_WHITE);
     if (showOutside) display.drawString(outsideSource + ": " + states[outside], 6, 123);
+    if (lastMinute >= 0) {
+      char timeText[6];
+      snprintf(timeText, sizeof(timeText), "%02d:%02d", lastMinute / 60, lastMinute % 60);
+      display.drawString(timeText, 201, 123);
+    }
     if (showInside) display.drawString(insideSource + ": " + states[inside], 12, 102);
     if (!configured || sequence == 0) {
       const char* message = !configured ? "USB-Setup starten" :
@@ -793,6 +904,59 @@ void setup() {
   status();
 }
 
+bool profileButtons(uint32_t now) {
+  if (!configured || baseRole) return false;
+  bool both = M5.BtnA.isPressed() && M5.BtnB.isPressed();
+  if (chosenSlot < 0 && both) {
+    if (!menuHeld) menuHeld = now;
+    if (!menuAttempted && now - menuHeld >= 1800) {
+      menuAttempted = true;
+      Preferences prefs;
+      if (prefs.begin("tallypilot", true)) {
+        if (prefs.isKey(slotKey(activeSlot).c_str())) chosenSlot = activeSlot;
+        prefs.end();
+      }
+      menuArmed = false;
+      menuTouched = now;
+      dirty = true;
+    }
+    return true;
+  }
+  menuHeld = 0;
+  menuAttempted = false;
+  if (chosenSlot < 0) return false;
+  if (now - menuTouched >= 15000) {
+    chosenSlot = -1;
+    dirty = true;
+    return true;
+  }
+  if (!menuArmed) {
+    menuArmed = !M5.BtnA.isPressed() && !M5.BtnB.isPressed();
+    return true;
+  }
+  if (M5.BtnA.wasClicked() || M5.BtnB.wasClicked()) {
+    Preferences prefs;
+    if (prefs.begin("tallypilot", false)) {
+      if (M5.BtnB.wasClicked()) {
+        String candidate = prefs.getString(slotKey(chosenSlot).c_str(), "");
+        JsonDocument doc;
+        if (!deserializeJson(doc, candidate) && settings(doc, false, false) &&
+            prefs.putString("config", candidate) == candidate.length()) restartAt = now + 150;
+        chosenSlot = -1;
+      } else {
+        for (int offset = 1; offset <= 4; ++offset) {
+          int nextSlot = (chosenSlot + offset) % 4;
+          if (prefs.isKey(slotKey(nextSlot).c_str())) { chosenSlot = nextSlot; break; }
+        }
+      }
+      prefs.end();
+    }
+    menuTouched = now;
+    dirty = true;
+  }
+  return true;
+}
+
 void loop() {
   M5.update();
   serialInput();
@@ -811,16 +975,20 @@ void loop() {
     manageWifi(now);
     updateConfig(now);
   }
-  if (M5.BtnA.wasClicked()) {
+  bool handlingProfile = profileButtons(now);
+  if (!handlingProfile && M5.BtnA.wasClicked()) {
     diagnostics = !diagnostics;
     dirty = true;
   }
-  if (M5.BtnB.wasClicked() && !diagnostics && sequence &&
+  if (!handlingProfile && M5.BtnB.wasClicked() && !diagnostics && sequence &&
       requireAck && !chatId.isEmpty() && shownId == chatId && confirmedAck != chatId) {
     pendingAck = chatId;
     send("TP1|chat_rcpt|" + deviceId + "|" + session + "|" + chatId + "|ack");
     dirty = true;
   }
+  int minute = clockSynced ? (clockSeconds + (now - clockAt) / 1000) % 86400 / 60 : -1;
+  if (minute != lastMinute) { lastMinute = minute; dirty = true; }
+  if (baseRole && baseCount && now - baseViewAt >= 3500) { baseCount = 0; dirty = true; }
   if (now - lastLinkCheck >= 200) {
     lastLinkCheck = now;
     static int previousBars = -2;

@@ -1,4 +1,4 @@
-param([switch]$ReuseFirmware)
+param([switch]$ReuseFirmware, [switch]$Installer)
 
 $ErrorActionPreference = 'Stop'
 $env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'
@@ -9,7 +9,7 @@ $firmware = Join-Path $firmwareBuild 'tallypager-pilot'
 $bundle = Join-Path $PSScriptRoot 'obj/bundle'
 $firmwarePackage = Join-Path $PSScriptRoot 'obj/firmware-package'
 $tools = Join-Path $PSScriptRoot 'obj/esptool'
-$version = '0.6.3'
+$version = '0.7.0'
 $output = Join-Path $project "dist/$version"
 $zip = Join-Path $tools 'esptool-v5.1.0-windows-amd64.zip'
 $platformHome = if ($env:PLATFORMIO_CORE_DIR) { $env:PLATFORMIO_CORE_DIR } else { Join-Path $env:USERPROFILE '.platformio' }
@@ -66,9 +66,22 @@ if ($LASTEXITCODE -ne 0) { throw 'Windows-Build fehlgeschlagen.' }
 
 $exe = Join-Path $output 'TallyPager-Windows-x64.exe'
 Copy-Item -LiteralPath (Join-Path $publish 'TallyPager.exe') -Destination $exe
-foreach ($file in @($exe, $firmwareZip)) {
+$releaseFiles = @($exe, $firmwareZip)
+if ($Installer) {
+    $compiler = (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source
+    if (-not $compiler) {
+        $compiler = @(${env:ProgramFiles(x86)}, $env:ProgramFiles, (Join-Path $env:LOCALAPPDATA 'Programs')) |
+            ForEach-Object { Join-Path $_ 'Inno Setup 6/ISCC.exe' } |
+            Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    }
+    if (-not $compiler) { throw 'Inno Setup 6 (ISCC.exe) fehlt.' }
+    & $compiler "/DAppVersion=$version" "/DArtifacts=$output" (Join-Path $PSScriptRoot 'installer.iss')
+    if ($LASTEXITCODE -ne 0) { throw 'Installer-Build fehlgeschlagen.' }
+    $releaseFiles += Join-Path $output 'TallyPager-Setup-Windows-x64.exe'
+}
+foreach ($file in $releaseFiles) {
     $hash = (Get-FileHash -LiteralPath $file).Hash.ToLowerInvariant()
     $name = Split-Path -Leaf $file
     Set-Content -LiteralPath ($file + '.sha256') -Value "$hash  $name" -Encoding ascii
 }
-Get-Item -LiteralPath $exe,$firmwareZip | Select-Object FullName,Length
+Get-Item -LiteralPath $releaseFiles | Select-Object FullName,Length

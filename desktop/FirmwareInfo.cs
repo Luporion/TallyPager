@@ -17,7 +17,11 @@ internal sealed class FirmwareInfo
         [RadioBase] = "Funkbasis",
         ["espnow"] = "ESP-NOW",
         ["espnow-lr"] = "ESP-NOW LR",
-        ["ble"] = "BLE"
+        ["ble"] = "BLE",
+        ["usb-read-settings"] = "Stick-Einstellungen per USB auslesen",
+        ["clock"] = "Uhrzeit",
+        ["device-slots"] = "Geräteprofile am Stick",
+        ["base-preview"] = "Mini-Anzeige auf der Funkbasis"
     };
     private static readonly string[] V04 = [Usb, "link-stats"];
     private static readonly string[] V05 = [.. V04, Acknowledge, "diagnostics"];

@@ -1,16 +1,21 @@
-# TallyPager 0.6.3
+# TallyPager 0.7.0
 
 Tally und Chat für mobile Kameras mit dem M5StickC Plus2. Die Windows-App kann ATEM und vMix direkt lesen oder Tally Arbiter als Quelle verwenden. CameraCue 0.1.4 bleibt als eigener [Build für Tally Arbiter](CameraCue/README.md) verfügbar.
 
 ## Start und Einrichtung
 
-1. `TallyPager-Windows-x64.exe` und `TallyPager-Firmware-M5StickC-Plus2-0.6.3.zip` aus `dist/0.6.3/` in denselben Ordner legen. Die EXE per Doppelklick starten. Windows benötigt dafür keine separate .NET-Installation. Jeder Release-Build landet unter `dist/<Version>/` im Projektordner.
+1. Für die portable Variante `TallyPager-Windows-x64.exe` und `TallyPager-Firmware-M5StickC-Plus2-0.7.0.zip` aus `dist/0.7.0/` in denselben Ordner legen. Für die installierbare Variante `TallyPager-Setup-Windows-x64.exe` starten. Setup installiert die App samt Firmwarepaket für das Windows-Benutzerkonto und legt einen Startmenüeintrag an. Auch spätere Setup-Versionen aktualisieren diese Installation. Die App benötigt keine separate .NET-Installation.
 2. Unter **Stick einrichten/verwalten → USB** den Port, die IPv4-Adresse des PCs im Kameranetz und den Sticknamen wählen. Firmwareversion und Funktionen lassen sich mit **Firmware lesen** prüfen. **Firmware aktualisieren** verwendet das separate ZIP und prüft vor dem Flashen Modell, Version und Prüfsummen. **Stick einrichten** verwendet die bereits installierte Firmware, soweit sie den gewählten Modus unterstützt.
 3. WLAN-Name und Passwort eingeben oder beide Felder für das gespeicherte WLAN leer lassen. Der Stick benötigt ein 2,4-GHz-WLAN und muss den PC per UDP auf Port 46224 erreichen.
 4. Unter **Externe Verbindungen → Mixer und Zuordnung** die gewünschten Quellen verbinden. Einen Stick in der Tabelle auswählen, pro Ebene Quelle und Eingang wählen und die Zuordnung speichern. **Aus · ausblenden** entfernt Farbe und Quellzeile für diese Ebene. **Innen und außen tauschen** speichert den Tausch sofort. Der Stick zeigt die zugeordnete Quelle an, zum Beispiel `ATEM: LIVE`.
 5. Unter **Regie** einen oder mehrere Sticks auswählen. **Enter** sendet den Inhalt der gerade bearbeiteten Zeile. Jede Zeile hat **Leeren** und **Senden**. **Chat und Next senden** überträgt beide Felder. Einzelaktionen erhalten den jeweils anderen Text pro Stick.
 
 Für die Kaskade kann pro Stick innen sein physischer ATEM-Eingang und außen der in vMix eingespeiste ATEM-Ausgang gewählt werden. Bei direkter vMix-Kamera kann der vMix-Eingang auf jede gewünschte Ebene gelegt werden. Fehlende Quellen oder Zuordnungen zeigen Grau, bestätigter inaktiver Zustand Blau, Preview Grün, Program Rot.
+
+### vMix verbinden
+
+- Unter **Settings → Web Controller** muss für den TCP-Weg **TCP API → Enabled** aktiv sein. Läuft TallyPager auf dem vMix-PC, unter **Externe Verbindungen → vMix** `127.0.0.1` eintragen. Ein Hostname oder eine IP aktiviert TCP auf Port 8099. Falls `SUBSCRIBE TALLY` ausbleibt oder abgelehnt wird, fragt TallyPager `TALLY` und `XML` direkt ab. [vMix TCP API](https://www.vmix.com/help30/TCPAPI.html)
+- Mit `http://127.0.0.1:8088` im selben Feld verwendet TallyPager den Web Controller. Den Port aus vMix übernehmen und für lokalen Zugriff **Allow software on this computer access without login** aktivieren. Auf einem zweiten PC die erreichbare Web-Adresse des vMix-PCs und die API-Zugriffsfreigabe in vMix prüfen. Die Web-API zeigt Program, Preview und die gemeldeten Overlays aus dem aktuellen XML-Zustand. [vMix Web Controller](https://www.vmix.com/help30/WebController.html) · [vMix HTTP Web API](https://www.vmix.com/help30/DeveloperAPI.html)
 
 ## Updates über GitHub
 
@@ -20,6 +25,13 @@ Für die Kaskade kann pro Stick innen sein physischer ATEM-Eingang und außen de
 4. Den gewünschten M5StickC Plus2 per USB verbinden und unter **Stick einrichten/verwalten → USB → Firmware aktualisieren** auswählen. Ein Firmware-Update startet auf deine Bestätigung.
 
 Der Updater lädt aus den öffentlichen [TallyPager-Releases](https://github.com/Luporion/TallyPager/releases). Der GitHub-Workflow veröffentlicht zu einem passenden stabilen Git-Tag beide Dateien samt Prüfsummen. Der erste Build mit Updater wird einmal als EXE geöffnet.
+
+## Flotteneinrichtung und Geräteprofile
+
+- **Stick einrichten/verwalten → USB** meldet hinzugekommene und getrennte COM-Ports. **Stick auslesen** liest ab Firmware 0.7.0 die gespeicherten Daten über USB. Das Passwort ist im Dialog verdeckt und lässt sich mit **Anzeigen** einblenden.
+- **WLAN-Daten für weitere Sticks behalten** lässt die Eingaben nach erfolgreicher Einrichtung stehen. Mit **Stick-Nummer nach erfolgreicher Einrichtung erhöhen** folgt auf `Stick 1` der Name `Stick 2`. **Aktuelles merken** speichert WLAN-Daten explizit und verschlüsselt im Windows-Konto. Eine **Einrichtungsvorlage** merkt sich die übrigen USB-Felder und verweist auf das gespeicherte WLAN. Regieprofile speichern dagegen den Aufbau in der Regie mit Quellen und Kamerarollen.
+- Auf jedem M5StickC Plus2 können durch USB-Einrichtung bis zu vier **Geräteprofile** vorbereitet werden. Jedes Profil speichert auch WLAN, Core-Adresse und Funkmodus. Beide Tasten rund zwei Sekunden halten, beide loslassen und mit **A** das Profil wählen. **B** bestätigt den Wechsel. Das Gerät startet mit dem gewählten Profil neu.
+- Unter **Regie → Stick-Vorschau anzeigen** zeigt die App für den ausgewählten Stick ihren letzten Anzeigezustand und dessen Bestätigung. Eine USB-Funkbasis mit Firmware 0.7.0 zeigt bis zu vier über ihren Modus verwaltete Pager. Der Core überträgt die lokale PC-Uhrzeit über den aktiven Tally-Funkweg.
 
 ## Funkmodi und WLAN-Verwaltung
 

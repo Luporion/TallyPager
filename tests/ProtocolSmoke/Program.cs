@@ -81,6 +81,8 @@ try
     await TestCompanion();
     TestArbiter();
     await TestVmix();
+    await TestVmixWithoutSubscription();
+    await TestVmixWeb();
     await TestVmixFailure();
     using (var atem = new AtemSource("127.0.0.1"))
         Check(atem.State.Inputs.Length == 0, "An ATEM without a source must remain unknown");
@@ -203,6 +205,9 @@ static void TestFirmwareCompatibility(string settings)
     Check(!command.Contains("\"mode\""), "Old USB config must keep its original command shape");
     string modernCommand = PagerUsb.ConfigCommand(legacyBase!, pager, "192.168.1.1", "", "", "udp", "", 6);
     Check(modernCommand.Contains("\"mode\":\"udp\""), "Provisioning a 0.6.0 base must restore the correct pager mode");
+    var slots = legacyBase! with { Version = PagerUsb.Version, Features = ["usb-config", "radio-base", "device-slots"] };
+    string slotCommand = PagerUsb.ConfigCommand(slots, pager, "192.168.1.1", "Test-WLAN", "", "udp", "", 6, slot: 2);
+    Check(slotCommand.Contains("\"slot\":2"), "USB must transmit the selected device profile");
     try { PagerUsb.ConfigCommand(early!, pager, "", "", "", "ble", "", 6); throw new Exception("Unsupported USB mode accepted"); }
     catch (InvalidOperationException) { }
 
@@ -434,10 +439,19 @@ static void TestRadioBridge(string settings)
         Check(bridge.Outbound.All(p => p.Address == address) && core.Statuses().Single() is
             { Connection: Connection.Connected, Battery: 88, Rssi: null, Rtt: 18, Firmware.ExactVersion: false } status && status.Transport == mode,
             "Wireless relay must preserve signed tally, receipts and per-mode status");
-        Push($"TP1|firmware|{id}|{session}|0.6.1|chat-ack,usb-config");
+        Push($"TP1|firmware|{id}|{session}|0.6.1|chat-ack,usb-config,clock");
         core.Tick();
         Check(core.Statuses().Single() is { Firmware.VersionText: "0.6.1", Firmware.Advertised: true, CanAck: true },
             "New radio firmware must be able to report its exact version independently of the bridge");
+        var clockTimeout = Stopwatch.StartNew();
+        while (bridge.Outbound.All(frame => !frame.Payload.StartsWith($"TP1|clock|{id}|{session}|")) &&
+            clockTimeout.ElapsedMilliseconds < 700)
+        {
+            core.Tick();
+            Thread.Sleep(15);
+        }
+        Check(bridge.Outbound.Any(frame => frame.Payload.StartsWith($"TP1|clock|{id}|{session}|")),
+            "Clock must use the authenticated active radio session");
         core.AttachRadio(null);
         Check(bridge.Closed && !core.Statuses().Single().Online, "Detach must invalidate the radio session");
     }
@@ -567,7 +581,8 @@ static void TestProfiles(string settings)
         role.Outside?.Mixer == MixerKind.Atem, "Legacy source, pairing and layer assignments must migrate");
     var group = new TargetGroup(Guid.NewGuid(), "Kameras", [.. active.Roles.Select(r => r.Id)]);
     var text = new QuickText(Guid.NewGuid(), "Position", "Position halten", "Taufe", [], group.Id, true, 120);
-    store.Update(active with { Groups = [group], Texts = [text] });
+    const string webAddress = "http://127.0.0.1:8088";
+    store.Update(active with { Sources = active.Sources with { Vmix = webAddress }, Groups = [group], Texts = [text] });
     Check(store.Targets(text, core.Devices.Select(p => p.Id)).Devices.Length == 2, "Group must resolve both sticks");
     var operatorSession = new OperatorSession(core, store);
     operatorSession.SetText([id], "Laufende Anweisung", null);
@@ -593,7 +608,8 @@ static void TestProfiles(string settings)
     Check(File.Exists(Path.Combine(settings, "profiles-before-import.json")) && store.Active.Id == active.Id &&
         store.Active.Texts.Single().Id == text.Id && store.RoleFor(id)?.Id == role.Id, "Replace must preserve IDs and local bindings");
     var reloaded = new ProfileStore(settings, core.Devices);
-    Check(reloaded.Active.Texts.Single().Id == text.Id, "Restore must survive restart");
+    Check(reloaded.Active.Texts.Single().Id == text.Id && reloaded.Active.Sources.Vmix == webAddress,
+        "Restore, including a vMix web address, must survive restart");
     Console.WriteLine("PASS profile migration, DPAPI storage, export, group resolution, copy, invalid import, restore and activation");
 }
 
@@ -708,18 +724,93 @@ static async Task TestVmix()
     Console.WriteLine("PASS vMix TCP subscription, interleaved tally and fragmented UTF-8 XML");
 }
 
+static async Task TestVmixWithoutSubscription()
+{
+    using var end = new CancellationTokenSource(TimeSpan.FromSeconds(9));
+    var token = end.Token;
+    using var listener = new TcpListener(IPAddress.Loopback, 0);
+    listener.Start();
+    using var source = new VmixSource("127.0.0.1", ((IPEndPoint)listener.LocalEndpoint).Port);
+    var server = Task.Run(async () =>
+    {
+        using (var subscription = await listener.AcceptTcpClientAsync(token))
+        using (var reader = new StreamReader(subscription.GetStream(), Encoding.ASCII, leaveOpen: true))
+        {
+            Check(await reader.ReadLineAsync(token) == "SUBSCRIBE TALLY", "Expected the normal subscribe attempt");
+            Check(await reader.ReadLineAsync(token) is null, "Subscription socket should be closed before fallback");
+        }
+        using var poll = await listener.AcceptTcpClientAsync(token);
+        using var stream = poll.GetStream();
+        using var commands = new StreamReader(stream, Encoding.ASCII, leaveOpen: true);
+        while (await commands.ReadLineAsync(token) is string command)
+        {
+            string xml = "<vmix><inputs><input number=\"1\" key=\"one\" title=\"Kamera\"/></inputs></vmix>\r\n";
+            string reply = command switch
+            {
+                "XML" => $"XML {Encoding.UTF8.GetByteCount(xml)} Eingänge\r\n{xml}",
+                "TALLY" => "TALLY OK 2\r\n",
+                _ => throw new InvalidOperationException("Fallback must use read-only TALLY and XML")
+            };
+            await stream.WriteAsync(Encoding.UTF8.GetBytes(reply), token);
+        }
+    }, token);
+    while (source.State is not { Status: "Verbunden · TCP-Abfrage", Inputs: [{ Tally: 2, Key: "one" }] })
+        await Task.Delay(20, token);
+    source.Dispose();
+    try { await server; }
+    catch (IOException) { }
+    Console.WriteLine("PASS vMix ignores SUBSCRIBE but TCP read-only polling reports Preview and preserves the input key");
+}
+
+static async Task TestVmixWeb()
+{
+    using var end = new CancellationTokenSource(TimeSpan.FromSeconds(7));
+    var token = end.Token;
+    using var listener = new TcpListener(IPAddress.Loopback, 0);
+    listener.Start();
+    string address = $"http://127.0.0.1:{((IPEndPoint)listener.LocalEndpoint).Port}";
+    Check(VmixSource.ValidAddress(address) && !VmixSource.ValidAddress(address + "/api/?Function=Cut") &&
+        !VmixSource.ValidAddress(address.Replace("http://", "http://user:secret@", StringComparison.Ordinal)),
+        "The web endpoint must accept only a read-only API URL without embedded credentials");
+    using var source = new VmixSource(address);
+    async Task Reply(string status, string payload)
+    {
+        using var client = await listener.AcceptTcpClientAsync(token);
+        using var stream = client.GetStream();
+        using var reader = new StreamReader(stream, Encoding.ASCII, leaveOpen: true);
+        Check(await reader.ReadLineAsync(token) == "GET /api/ HTTP/1.1", "The Web adapter must only read the XML endpoint");
+        while (await reader.ReadLineAsync(token) is { Length: > 0 }) { }
+        byte[] body = Encoding.UTF8.GetBytes(payload);
+        await stream.WriteAsync(Encoding.ASCII.GetBytes(
+            $"HTTP/1.1 {status}\r\nContent-Length: {body.Length}\r\nConnection: close\r\n\r\n"), token);
+        await stream.WriteAsync(body, token);
+    }
+    const string inputs = "<vmix><inputs><input number=\"1\" key=\"a\" title=\"Bühne\"/>" +
+        "<input number=\"2\" key=\"b\" title=\"Kamera\"/><input number=\"3\" key=\"c\" title=\"Logo\"/></inputs>";
+    await Reply("200 OK", inputs + "<active>1</active><preview>2</preview><overlays><overlay>3</overlay></overlays></vmix>");
+    while (source.State.Inputs is not [{ Tally: 3, Name: "Bühne", Key: "a" }, { Tally: 2 }, { Tally: 3 }])
+        await Task.Delay(20, token);
+    await Reply("200 OK", inputs + "<active>2</active><preview>1</preview></vmix>");
+    while (source.State.Inputs is not [{ Tally: 2 }, { Tally: 3 }, { Tally: 1 }]) await Task.Delay(20, token);
+    await Reply("403 Forbidden", "");
+    while (!source.State.Status.Contains("verweigert", StringComparison.Ordinal)) await Task.Delay(20, token);
+    Check(source.State.Inputs.Length == 0, "A denied request must clear stale Tally");
+    Console.WriteLine("PASS vMix HTTP Web API reads Program, Preview and overlays; subsequent responses and denied access update state");
+}
+
 static async Task TestVmixFailure()
 {
-    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(7));
+    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
     using var server = new TcpListener(IPAddress.Loopback, 0);
     server.Start();
     using var source = new VmixSource("127.0.0.1", ((IPEndPoint)server.LocalEndpoint).Port);
     using var silent = await server.AcceptTcpClientAsync(timeout.Token);
-    while (!source.State.Status.Contains("Keine gültige Antwort auf SUBSCRIBE TALLY", StringComparison.Ordinal))
+    using var silentPoll = await server.AcceptTcpClientAsync(timeout.Token);
+    while (!source.State.Status.Contains("Keine gültige Antwort auf XML", StringComparison.Ordinal))
         await Task.Delay(20, timeout.Token);
     Check(source.State.Status.Contains("TCP verbunden", StringComparison.Ordinal) && source.State.Inputs.Length == 0,
         "A connected TCP socket without vMix replies must stay gray and show the failed protocol stage");
-    Console.WriteLine("PASS vMix distinguishes TCP reachability and subscription timeout");
+    Console.WriteLine("PASS vMix keeps a silent TCP service gray after both subscription and polling fail");
 }
 
 file sealed class FakeRadio(string mode) : IRadioBridge

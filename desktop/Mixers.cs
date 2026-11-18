@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Globalization;
+using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Xml.Linq;
@@ -109,19 +110,36 @@ internal sealed class AtemSource : IDisposable
 
 internal sealed class VmixSource : IDisposable
 {
+    private const int XmlLimit = 4_000_000;
+    private sealed class SubscriptionUnavailable : IOException { }
     private readonly CancellationTokenSource stop = new();
     private bool disposed;
     private volatile MixerState state = new("Verbinde …", []);
     public MixerState State => state;
 
-    public VmixSource(string host, int port = 8099)
+    public VmixSource(string address, int port = 8099)
     {
         var token = stop.Token;
-        _ = Task.Run(() => Run(host, port, token));
+        var endpoint = WebEndpoint(address);
+        _ = Task.Run(() => endpoint is null ? RunTcp(address, port, token) : RunWeb(endpoint, token));
     }
 
-    private async Task Run(string host, int port, CancellationToken token)
+    internal static bool ValidAddress(string address) => Uri.CheckHostName(address) != UriHostNameType.Unknown ||
+        WebEndpoint(address) is not null;
+
+    internal static Uri? WebEndpoint(string address)
     {
+        if (!Uri.TryCreate(address, UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https") ||
+            uri.HostNameType == UriHostNameType.Unknown || uri.UserInfo.Length != 0 ||
+            uri.Query.Length != 0 || uri.Fragment.Length != 0 ||
+            (uri.AbsolutePath != "/" && !uri.AbsolutePath.TrimEnd('/').Equals("/api", StringComparison.OrdinalIgnoreCase)))
+            return null;
+        return new UriBuilder(uri) { Path = "/api/" }.Uri;
+    }
+
+    private async Task RunTcp(string host, int port, CancellationToken token)
+    {
+        bool subscribe = true;
         while (!token.IsCancellationRequested)
         {
             bool tcpConnected = false;
@@ -134,8 +152,16 @@ internal sealed class VmixSource : IDisposable
                     await client.ConnectAsync(host, port, timeout.Token);
                 }
                 tcpConnected = true;
-                state = new("TCP erreichbar · warte auf SUBSCRIBE TALLY", []);
-                await Receive(client.GetStream(), token);
+                state = new(subscribe ? "TCP erreichbar · warte auf SUBSCRIBE TALLY" :
+                    "TCP erreichbar · frage TALLY und XML direkt ab", []);
+                await Receive(client.GetStream(), subscribe, token);
+            }
+            catch (SubscriptionUnavailable) when (!token.IsCancellationRequested)
+            {
+                // The first socket may still receive a late subscription reply or queued events.
+                subscribe = false;
+                state = new("Tally-Abonnement nicht verfügbar · versuche TCP-Abfrage", []);
+                continue;
             }
             catch (Exception error) when (error is IOException or SocketException or OperationCanceledException or
                 System.Xml.XmlException or TimeoutException)
@@ -156,14 +182,14 @@ internal sealed class VmixSource : IDisposable
         }
     }
 
-    private async Task Receive(NetworkStream stream, CancellationToken token)
+    private async Task Receive(NetworkStream stream, bool subscribe, CancellationToken token)
     {
         var reader = new VmixReader(stream);
         MixerInput[] inputs = [];
-        string current = "";
+        string? current = null;
         bool metadata = false;
-        string request = "SUBSCRIBE";
-        await Write(stream, "SUBSCRIBE TALLY", token);
+        string request = subscribe ? "SUBSCRIBE" : "";
+        if (subscribe) await Write(stream, "SUBSCRIBE TALLY", token);
         long deadline = Environment.TickCount64 + 3000;
         long tallyDue = 0, xmlDue = 0;
         var lineTask = reader.Line(token);
@@ -171,18 +197,19 @@ internal sealed class VmixSource : IDisposable
         {
             long now = Environment.TickCount64;
             if (request.Length > 0 && now >= deadline)
-                throw new TimeoutException($"Keine gültige Antwort auf {request switch { "SUBSCRIBE" => "SUBSCRIBE TALLY", _ => request }}");
+            {
+                if (request == "SUBSCRIBE") throw new SubscriptionUnavailable();
+                throw new TimeoutException($"Keine gültige Antwort auf {request}. vMix-Web-URL als Alternative prüfen.");
+            }
             if (request.Length == 0)
             {
                 if (now >= xmlDue)
                 {
                     request = "XML";
-                    xmlDue = now + 2000;
                 }
                 else if (now >= tallyDue)
                 {
                     request = "TALLY";
-                    tallyDue = now + 850;
                 }
                 if (request.Length > 0)
                 {
@@ -193,19 +220,26 @@ internal sealed class VmixSource : IDisposable
 
             // A TALLY event can arrive while waiting for any other response.
             if (await Task.WhenAny(lineTask, Task.Delay(50, token)) != lineTask) continue;
-            string line = await lineTask;
-            if (line.StartsWith("TALLY OK ", StringComparison.Ordinal))
+            string line;
+            try { line = (await lineTask).TrimEnd(' ', '\t'); }
+            catch (IOException) when (request == "SUBSCRIBE" && !token.IsCancellationRequested)
+            { throw new SubscriptionUnavailable(); }
+            if (line == "TALLY OK" || line.StartsWith("TALLY OK ", StringComparison.Ordinal))
             {
-                current = line[9..];
-                if (current.Length == 0 || current.Any(c => c is not ('0' or '1' or '2')))
+                current = line.Length <= 9 ? "" : line[9..];
+                if (current.Length > 1000 || current.Any(c => c is not ('0' or '1' or '2')))
                     throw new IOException("Ungültige TALLY-Antwort.");
-                if (request == "TALLY") request = "";
-                if (request != "SUBSCRIBE") Publish(inputs, metadata, current);
+                if (request == "TALLY")
+                {
+                    request = "";
+                    tallyDue = Environment.TickCount64 + 850;
+                }
+                if (request != "SUBSCRIBE") Publish(inputs, metadata, current, subscribe);
             }
             else if (line.StartsWith("XML ", StringComparison.Ordinal) &&
-                int.TryParse(line.AsSpan(4), NumberStyles.None, CultureInfo.InvariantCulture, out int length))
+                int.TryParse(line.Split(' ', 3)[1], NumberStyles.None, CultureInfo.InvariantCulture, out int length))
             {
-                if (length is < 1 or > 4_000_000) throw new IOException("Ungültige vMix-XML-Länge.");
+                if (length is < 1 or > XmlLimit) throw new IOException("Ungültige vMix-XML-Länge.");
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
                 timeout.CancelAfter(3000);
                 string xml;
@@ -217,42 +251,110 @@ internal sealed class VmixSource : IDisposable
                     .SequenceEqual(updated.Select(input => (input.Number, input.Key))))
                 {
                     // Wait for a fresh TALLY after a preset/layout change.
-                    current = "";
+                    current = null;
                     tallyDue = 0;
                 }
                 inputs = updated;
                 metadata = true;
-                if (request == "XML") request = "";
-                Publish(inputs, metadata, current);
+                if (request == "XML")
+                {
+                    request = "";
+                    xmlDue = Environment.TickCount64 + 2000;
+                }
+                Publish(inputs, metadata, current, subscribe);
             }
             else if (line == "SUBSCRIBE OK TALLY" && request == "SUBSCRIBE")
             {
                 request = "";
                 state = new("SUBSCRIBE TALLY bestätigt · warte auf XML-Eingänge und TALLY", []);
             }
-            else if (request.Length > 0 && line.StartsWith(request + " ER", StringComparison.Ordinal))
+            else if (request.Length > 0 && (line == request + " ER" || line.StartsWith(request + " ER ", StringComparison.Ordinal)))
+            {
+                if (request == "SUBSCRIBE") throw new SubscriptionUnavailable();
                 throw new IOException($"vMix hat {request} abgelehnt.");
+            }
             lineTask = reader.Line(token);
         }
     }
 
-    private void Publish(MixerInput[] inputs, bool metadata, string tally)
+    private void Publish(MixerInput[] inputs, bool metadata, string? tally, bool subscribe)
     {
-        if (!metadata || tally.Length == 0)
+        if (!metadata || tally is null)
         {
             state = new(metadata ? "XML-Eingänge empfangen · warte auf TALLY" :
                 "TALLY empfangen · warte auf XML-Eingänge", inputs);
             return;
         }
-        state = new("Verbunden", inputs.Select(input => input with
+        state = new(subscribe ? "Verbunden" : "Verbunden · TCP-Abfrage", inputs.Select(input => input with
         {
             Tally = input.Number <= tally.Length ? DecodeTally(tally[input.Number - 1]) : 0
         }).ToArray());
     }
 
-    internal static MixerInput[] ParseInputs(string xml)
+    private async Task RunWeb(Uri endpoint, CancellationToken token)
     {
-        var root = XDocument.Parse(xml).Root;
+        using var http = new HttpClient(new HttpClientHandler { AllowAutoRedirect = false, UseProxy = false });
+        while (!token.IsCancellationRequested)
+        {
+            int delay = 500;
+            try
+            {
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+                timeout.CancelAfter(3000);
+                using var response = await http.GetAsync(endpoint, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
+                if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+                    throw new IOException("Web-API verweigert den Zugriff. API-Freigabe und lokalen Zugriff in vMix prüfen.");
+                response.EnsureSuccessStatusCode();
+                if (response.Content.Headers.ContentLength > XmlLimit) throw new IOException("vMix-XML ist zu groß.");
+                await using var stream = await response.Content.ReadAsStreamAsync(timeout.Token);
+                using var data = new MemoryStream();
+                var buffer = new byte[8192];
+                int count;
+                while ((count = await stream.ReadAsync(buffer, timeout.Token)) > 0)
+                {
+                    if (data.Length + count > XmlLimit) throw new IOException("vMix-XML ist zu groß.");
+                    data.Write(buffer, 0, count);
+                }
+                data.Position = 0;
+                var xml = await XDocument.LoadAsync(data, LoadOptions.None, timeout.Token);
+                state = new("Verbunden · Web-API", ParseWebInputs(xml.Root));
+            }
+            catch (Exception error) when (error is IOException or HttpRequestException or System.Xml.XmlException or OperationCanceledException)
+            {
+                if (token.IsCancellationRequested) return;
+                string detail = error switch
+                {
+                    OperationCanceledException => "Zeitüberschreitung",
+                    System.Xml.XmlException => "Ungültige vMix-XML-Antwort",
+                    HttpRequestException httpError => httpError.StatusCode is { } code ? $"HTTP {(int)code}" : "Verbindung fehlgeschlagen",
+                    _ => error.Message
+                };
+                state = new($"vMix-Web-API · {detail} · neuer Versuch", []);
+                delay = 1250;
+            }
+            try { await Task.Delay(delay, token); }
+            catch (OperationCanceledException) { return; }
+        }
+    }
+
+    private static MixerInput[] ParseWebInputs(XElement? root)
+    {
+        var inputs = ParseInputs(root);
+        if (!int.TryParse(root?.Element("active")?.Value, out int active) || active < 0 ||
+            !int.TryParse(root.Element("preview")?.Value, out int preview) || preview < 0)
+            throw new IOException("Die Web-API meldet weder einen gültigen Program- noch Preview-Eingang.");
+        var overlays = (root.Element("overlays")?.Elements("overlay") ?? [])
+            .Select(entry => int.TryParse(entry.Value, out int input) ? input : 0).ToHashSet();
+        return inputs.Select(input => input with
+        {
+            Tally = input.Number == active || overlays.Contains(input.Number) ? 3 : input.Number == preview ? 2 : 1
+        }).ToArray();
+    }
+
+    internal static MixerInput[] ParseInputs(string xml) => ParseInputs(XDocument.Parse(xml).Root);
+
+    private static MixerInput[] ParseInputs(XElement? root)
+    {
         if (root?.Name.LocalName != "vmix" || root.Element("inputs") is not { } inputs)
             throw new IOException("XML-Antwort enthält keine vMix-Eingangsliste.");
         return inputs.Elements("input")

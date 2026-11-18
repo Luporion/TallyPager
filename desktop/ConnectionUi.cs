@@ -22,6 +22,7 @@ internal sealed partial class MainWindow
     private string? wifiDevice;
     private bool wifiEditing;
     private bool wifiSetupSelected;
+    private long lastBasePreview;
 
     private static ComboBox ModePicker(bool includeUdp)
     {
@@ -95,7 +96,7 @@ internal sealed partial class MainWindow
         Row(remote, "Name des Sticks", wifiName);
         Row(remote, "PC-Adresse am Stick", wifiHost);
         Row(remote, "Neuer WLAN-Name", wifiNetwork);
-        Row(remote, "Neues WLAN-Passwort", wifiPassword);
+        Row(remote, "Neues WLAN-Passwort", wifiPassword, Reveal(wifiPassword));
         wifiApply.Enabled = false;
         wifiApply.Click += async (_, _) => await ApplyWifi();
         Full(remote, wifiApply);
@@ -244,6 +245,11 @@ internal sealed partial class MainWindow
     private void RefreshConnectionTools()
     {
         if (activeRadio?.Failure is { } failure) DisconnectBase("USB-Funkbasis getrennt · " + failure);
+        if (activeRadio is { } bridge && Environment.TickCount64 - lastBasePreview >= 1000)
+        {
+            lastBasePreview = Environment.TickCount64;
+            bridge.SendBaseView(core.Statuses());
+        }
         if (tabs.SelectedTab != setup || !wifiSetupSelected) return;
         var selected = SelectedWifi();
         wifiDetails.Text = selected is { Settings: { } settings }

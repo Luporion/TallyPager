@@ -26,9 +26,19 @@ jobs:
           python-version: '3.11'
       - name: Install PlatformIO
         run: python -m pip install platformio==6.2.0
+      - name: Install Inno Setup 6
+        shell: pwsh
+        run: |
+          $setup = Join-Path $env:RUNNER_TEMP 'innosetup-6.7.3.exe'
+          Invoke-WebRequest 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe' -OutFile $setup
+          if ((Get-FileHash -LiteralPath $setup).Hash -ne '9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732') {
+            throw 'Inno Setup SHA-256 mismatch.'
+          }
+          $install = Start-Process -FilePath $setup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER' -Wait -PassThru -WindowStyle Hidden
+          if ($install.ExitCode -ne 0) { throw 'Inno Setup installation failed.' }
       - name: Build pilot
         shell: pwsh
-        run: ./desktop/build-release.ps1
+        run: ./desktop/build-release.ps1 -Installer
       - name: Test protocol and firmware package
         shell: pwsh
         run: |
@@ -69,7 +79,8 @@ jobs:
           $candidates = @(Get-ChildItem release -Recurse -Filter $exe)
           if ($candidates.Count -ne 1 -or $candidates[0].Directory.Name -ne $version) { throw 'Build and Git tag do not match.' }
           $folder = $candidates[0].Directory.FullName
-          $assets = @($exe, $zip, "$exe.sha256", "$zip.sha256", 'THIRD-PARTY-NOTICES.txt', 'esptool-LICENSE.txt') |
+          $setup = 'TallyPager-Setup-Windows-x64.exe'
+          $assets = @($exe, $zip, $setup, "$exe.sha256", "$zip.sha256", "$setup.sha256", 'THIRD-PARTY-NOTICES.txt', 'esptool-LICENSE.txt') |
             ForEach-Object { (Get-Item -LiteralPath (Join-Path $folder $_)).FullName }
           gh release create $env:GITHUB_REF_NAME @assets --verify-tag --latest --title "TallyPager $version" --generate-notes
           if ($LASTEXITCODE -ne 0) { throw 'GitHub release publication failed.' }
