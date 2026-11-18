@@ -107,6 +107,10 @@ internal sealed class RadioBridge : IRadioBridge
 
 internal static class Transport
 {
+    public static string? DisplayAddress(string? address) => address is not null && IsMac(address)
+        ? Convert.ToHexString(Convert.FromHexString(address)).Insert(10, ":").Insert(8, ":").Insert(6, ":")
+            .Insert(4, ":").Insert(2, ":")
+        : null;
     public static bool IsRadio(string mode) => mode is "espnow" or "espnow-lr" or "ble";
     public static bool IsMac(string address) => address.Length == 12 &&
         address.All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f') &&

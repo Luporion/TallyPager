@@ -1,4 +1,5 @@
 [Setup]
+MinVersion=10.0.19041
 AppId=TallyPager.Luporion
 AppName=TallyPager
 AppVersion={#AppVersion}

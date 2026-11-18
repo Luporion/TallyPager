@@ -17,10 +17,39 @@ internal sealed record Preview(int Inside, int Outside, string Chat, string Next
     public static Preview Clear { get; } = new(0, 0, "", "");
 }
 internal enum Connection { Disconnected, Delayed, Connected }
+internal readonly record struct DeviceSlot(int Number, string Mode, string? Gateway = null, int Channel = 0)
+{
+    public override string ToString() => $"Profil {Number + 1} · {Transport.Name(Mode)}";
+
+    public static DeviceSlot[] Parse(string fields)
+    {
+        var slots = new List<DeviceSlot>(4);
+        foreach (string field in fields.Split(';'))
+        {
+            string[] values = field.Split(',');
+            if (values.Length < 2 || values[0].Length != 1 || values[0][0] is < '0' or > '3') continue;
+            int number = values[0][0] - '0';
+            if (slots.Any(slot => slot.Number == number)) continue;
+            switch (values)
+            {
+                case [_, "udp" or "ble"]:
+                    slots.Add(new(number, values[1]));
+                    break;
+                case [_, "espnow" or "espnow-lr", var gateway, var channel]
+                    when Transport.IsMac(gateway) && int.TryParse(channel, NumberStyles.None, CultureInfo.InvariantCulture, out int parsed)
+                        && parsed is >= 1 and <= 13:
+                    slots.Add(new(number, values[1], gateway, parsed));
+                    break;
+            }
+        }
+        return slots.ToArray();
+    }
+}
 internal sealed record PagerStatus(string Id, string Name, Connection Connection, int? Battery, bool PreviewReceived,
     int? Rssi, int? Rtt, Preview View, bool CanAck, DateTimeOffset? SentAt,
     DateTimeOffset? ReceivedAt, DateTimeOffset? AcknowledgedAt, long? TelemetryAgeMs,
-    string Transport, WifiSettings? Settings, FirmwareInfo? Firmware)
+    string Transport, WifiSettings? Settings, FirmwareInfo? Firmware, string? Address = null,
+    bool LastKnownAddress = false, int? ActiveSlot = null, DeviceSlot[]? Slots = null)
 {
     public bool Online => Connection != Connection.Disconnected;
 }
@@ -35,6 +64,7 @@ internal sealed class PilotCore : IDisposable
     private readonly Dictionary<string, Link> devices = new(StringComparer.Ordinal);
     private readonly UdpClient udp = new(AddressFamily.InterNetwork);
     private IRadioBridge? radio;
+    private IRadioBridge? bluetooth;
     private long lastBroadcast;
 
     private sealed record Peer(IPEndPoint? Ip, IRadioBridge? Bridge = null, string? Mac = null);
@@ -55,6 +85,16 @@ internal sealed class PilotCore : IDisposable
         public long LastSent { get; set; } = -6000;
         public bool Testing { get; set; }
         public TaskCompletionSource<WifiSettings> Completion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
+    private sealed class SlotRequest(string id, DeviceSlot slot, string session, long deadline)
+    {
+        public string Id { get; } = id;
+        public DeviceSlot Slot { get; } = slot;
+        public string Session { get; } = session;
+        public long Deadline { get; } = deadline;
+        public long LastSent { get; set; } = -6000;
+        public bool Testing { get; set; }
+        public TaskCompletionSource<string> Completion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
     private sealed class Link(Pager pager)
     {
@@ -88,6 +128,10 @@ internal sealed class PilotCore : IDisposable
         public long DiscoverUntil { get; set; }
         public uint ConfigCounter { get; set; }
         public ConfigRequest? Configuration { get; set; }
+        public SlotRequest? SlotChange { get; set; }
+        public DeviceSlot[] Slots { get; set; } = [];
+        public int? ActiveSlot { get; set; }
+        public string? LastAddress { get; set; }
         public string Transport { get; set; } = pager.ConfiguredTransport ?? "udp";
     }
 
@@ -172,12 +216,16 @@ internal sealed class PilotCore : IDisposable
                 firmware.VersionText == managedFirmware.VersionText) firmware = managedFirmware;
             var wifi = managedFirmware?.Supports(FirmwareInfo.Wifi) == true ? managed?.Settings :
                 online && link.Firmware?.Supports(FirmwareInfo.Wifi) == true ? link.Settings : null;
+            var address = online ? link.LastAddress : managed?.Endpoint.Address.ToString();
+            bool canSwitch = online && link.Firmware?.Supports(FirmwareInfo.RemoteSlots) == true;
             return new PagerStatus(link.Pager.Id, link.Pager.Name, state, link.Battery,
                 online && link.PreviewSequence > 0 && link.SeenSequence >= link.PreviewSequence,
                 online ? link.Rssi : null, online ? link.Rtt : null, link.Preview, CanAcknowledge(link),
                 link.SentAt, link.ReceivedAt, link.AcknowledgedAt, link.SeenAt >= 0 ? age : null,
                 link.Transport, wifi, firmware ?? link.LastFirmware ??
-                    (online && link.Transport != "udp" ? FirmwareInfo.LegacyRadio : null));
+                    (online && link.Transport != "udp" ? FirmwareInfo.LegacyRadio : null),
+                address ?? link.LastAddress, address is null && link.LastAddress is not null,
+                canSwitch ? link.ActiveSlot : null, canSwitch ? link.Slots : null);
         }).ToArray();
     }
 
@@ -227,16 +275,15 @@ internal sealed class PilotCore : IDisposable
             var datagram = udp.Receive(ref source);
             if (datagram.Length <= 900) Handle(new(source), Encoding.ASCII.GetString(datagram));
         }
-        if (radio is { } bridge)
-            for (int i = 0; i < 24 && bridge.TryRead(out var packet); i++)
-                if (packet.Payload.Length <= 900 && Transport.IsMac(packet.Address))
-                    Handle(new(null, bridge, packet.Address), packet.Payload);
+        ReadRadio(radio);
+        ReadRadio(bluetooth);
         long now = Environment.TickCount64;
         if (now - lastBroadcast < 250) return;
         lastBroadcast = now;
         foreach (var link in devices.Values)
         {
             RetryConfiguration(link, now);
+            RetrySlot(link, now);
             if (now - Math.Max(link.SeenAt, link.HandshakeAt) < 5000)
             {
                 SendState(link);
@@ -251,17 +298,67 @@ internal sealed class PilotCore : IDisposable
         }
     }
 
-    public void AttachRadio(IRadioBridge? bridge)
+    private void ReadRadio(IRadioBridge? bridge)
     {
-        radio?.Dispose();
-        radio = bridge;
+        if (bridge is null) return;
+        for (int i = 0; i < 24 && bridge.TryRead(out var packet); i++)
+            if (packet.Payload.Length <= 900 && Transport.IsMac(packet.Address))
+                Handle(new(null, bridge, packet.Address), packet.Payload);
+    }
+
+    public void AttachRadio(IRadioBridge? bridge) => ReplaceBridge(ref radio, bridge);
+    public void AttachBluetooth(IRadioBridge? bridge) => ReplaceBridge(ref bluetooth, bridge);
+
+    private void ReplaceBridge(ref IRadioBridge? current, IRadioBridge? bridge)
+    {
+        if (ReferenceEquals(current, bridge)) return;
+        var previous = current;
+        previous?.Dispose();
+        current = bridge;
+        if (previous is null) return;
         foreach (Link link in devices.Values)
         {
-            if (link.Pending?.Endpoint.Bridge is not null) link.Pending = null;
-            if (link.Active?.Endpoint.Bridge is null) continue;
+            if (ReferenceEquals(link.Pending?.Endpoint.Bridge, previous)) link.Pending = null;
+            if (!ReferenceEquals(link.Active?.Endpoint.Bridge, previous)) continue;
             link.Active = null;
             link.SeenAt = -6000;
         }
+    }
+
+    public Task<string> SwitchSlot(string id, DeviceSlot slot)
+    {
+        long now = Environment.TickCount64;
+        if (!devices.TryGetValue(id, out var link) || link.Active is not { } active || now - link.SeenAt >= 3500 ||
+            link.Paused || link.Firmware?.Supports(FirmwareInfo.RemoteSlots) != true)
+            throw new InvalidOperationException("Stick per Tally verbinden und Firmware für den Funkwechsel prüfen.");
+        if (link.Configuration is not null || link.SlotChange is not null)
+            throw new InvalidOperationException("Für diesen Stick läuft bereits eine Änderung.");
+        if (!link.Slots.Contains(slot) || link.ActiveSlot == slot.Number)
+            throw new InvalidOperationException("Ein anderes, bereits auf dem Stick gespeichertes Geräteprofil auswählen.");
+        var request = new SlotRequest(RandomHex(16), slot, active.Session, now + 45000);
+        link.SlotChange = request;
+        RetrySlot(link, now);
+        return request.Completion.Task;
+    }
+
+    private void RetrySlot(Link link, long now)
+    {
+        if (link.SlotChange is not { } request) return;
+        if (now >= request.Deadline)
+        {
+            link.SlotChange = null;
+            request.Completion.TrySetResult("timeout");
+            return;
+        }
+        if (link.Active is not { } active || active.Session != request.Session || request.Testing ||
+            now - request.LastSent < 750) return;
+        request.LastSent = now;
+        try
+        {
+            Send(link, active.Endpoint, FormattableString.Invariant(
+                $"TP1|switch_slot|{link.Pager.Id}|{active.Session}|{request.Id}|{request.Slot.Number}"));
+        }
+        catch (SocketException) { } // The wireless peer can drop between retries.
     }
 
     public Task<WifiSettings> ChangeWifi(string id, WifiChange change)
@@ -269,7 +366,8 @@ internal sealed class PilotCore : IDisposable
         long now = Environment.TickCount64;
         if (!devices.TryGetValue(id, out var link))
             throw new InvalidOperationException("Der Stick ist auf diesem Rechner nicht gepaart.");
-        if (link.Configuration is not null) throw new InvalidOperationException("Für diesen Stick läuft bereits eine Änderung.");
+        if (link.Configuration is not null || link.SlotChange is not null)
+            throw new InvalidOperationException("Für diesen Stick läuft bereits eine Änderung.");
         var managed = CurrentManagement(link, now);
         var active = link.Settings is not null && link.Firmware?.Supports(FirmwareInfo.Wifi) == true && now - link.SeenAt < 3500 &&
             link.Active?.Endpoint.Ip is not null ? link.Active : null;
@@ -346,6 +444,7 @@ internal sealed class PilotCore : IDisposable
             {
                 var discovered = new ManagedPeer(management, access, now + 90000) { Settings = found, LastSeen = now };
                 link.Managed = discovered;
+                link.LastAddress ??= management.Address.ToString();
                 ObserveFirmware(link, FirmwareInfo.Read(found.Version), discovered);
                 link.DiscoverNonce = null;
             }
@@ -381,6 +480,9 @@ internal sealed class PilotCore : IDisposable
             link.CanAck = false;
             link.Firmware = null;
             link.Settings = null;
+            link.Slots = [];
+            link.ActiveSlot = null;
+            link.LastAddress = source.Ip?.Address.ToString() ?? Transport.DisplayAddress(source.Mac);
             link.ConfigCounter = 0;
             link.Transport = source.Bridge?.Mode ?? "udp";
             link.HandshakeAt = now;
@@ -394,6 +496,22 @@ internal sealed class PilotCore : IDisposable
                 link.CanAck = true;
             else if (fields[1] == "firmware")
                 ObserveFirmware(link, ParseFirmware(fields));
+            else if (fields is [_, "slots", _, _, var slot, var entries] && InRange(slot, 0, 3) is int current)
+            {
+                link.ActiveSlot = current;
+                link.Slots = DeviceSlot.Parse(entries);
+            }
+            else if (fields is [_, "slot_result", _, _, var request, var result] &&
+                link.SlotChange is { } change && request == change.Id)
+            {
+                if (result == "testing") change.Testing = true;
+                else if (result is "rollback" or "rejected" || result == "applied" &&
+                    active.Session != change.Session && link.Transport == change.Slot.Mode && link.ActiveSlot == change.Slot.Number)
+                {
+                    link.SlotChange = null;
+                    change.Completion.TrySetResult(result);
+                }
+            }
             else if (source.Ip is { } ip && fields[1] == "cfg_info" &&
                 WifiManagement.Parse(fields, ip.Address) is { } settings)
             {
@@ -506,6 +624,7 @@ internal sealed class PilotCore : IDisposable
     public void Dispose()
     {
         radio?.Dispose();
+        bluetooth?.Dispose();
         Diagnostics.Dispose();
         udp.Dispose();
     }

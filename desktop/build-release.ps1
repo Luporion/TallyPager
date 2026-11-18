@@ -9,7 +9,7 @@ $firmware = Join-Path $firmwareBuild 'tallypager-pilot'
 $bundle = Join-Path $PSScriptRoot 'obj/bundle'
 $firmwarePackage = Join-Path $PSScriptRoot 'obj/firmware-package'
 $tools = Join-Path $PSScriptRoot 'obj/esptool'
-$version = '0.7.0'
+$version = '0.8.0'
 $output = Join-Path $project "dist/$version"
 $zip = Join-Path $tools 'esptool-v5.1.0-windows-amd64.zip'
 $platformHome = if ($env:PLATFORMIO_CORE_DIR) { $env:PLATFORMIO_CORE_DIR } else { Join-Path $env:USERPROFILE '.platformio' }
@@ -59,7 +59,7 @@ $publish = Join-Path $PSScriptRoot 'obj/portable'
 $publishArgs = @(
     (Join-Path $PSScriptRoot 'TallyPager.csproj'), '-c', 'Release', '-r', 'win-x64', '-o', $publish,
     '-p:SelfContained=true', '-p:PublishSingleFile=true', '-p:IncludeNativeLibrariesForSelfExtract=true',
-    '-p:EnableCompressionInSingleFile=true', '-p:DebugType=None', '-p:RuntimeFrameworkVersion=10.0.15'
+    '-p:EnableCompressionInSingleFile=true', '-p:DebugType=None', '-p:TargetLatestRuntimePatch=true'
 )
 dotnet publish @publishArgs
 if ($LASTEXITCODE -ne 0) { throw 'Windows-Build fehlgeschlagen.' }

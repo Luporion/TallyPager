@@ -6,6 +6,7 @@ internal sealed class FirmwareInfo
     public const string Acknowledge = "chat-ack";
     public const string Wifi = "wifi-config";
     public const string RadioBase = "radio-base";
+    public const string RemoteSlots = "remote-slots";
     private static readonly Dictionary<string, string> Known = new(StringComparer.Ordinal)
     {
         [Usb] = "USB-Einrichtung",
@@ -21,7 +22,8 @@ internal sealed class FirmwareInfo
         ["usb-read-settings"] = "Stick-Einstellungen per USB auslesen",
         ["clock"] = "Uhrzeit",
         ["device-slots"] = "Geräteprofile am Stick",
-        ["base-preview"] = "Mini-Anzeige auf der Funkbasis"
+        ["base-preview"] = "Mini-Anzeige auf der Funkbasis",
+        [RemoteSlots] = "Geräteprofil über Funk wechseln"
     };
     private static readonly string[] V04 = [Usb, "link-stats"];
     private static readonly string[] V05 = [.. V04, Acknowledge, "diagnostics"];

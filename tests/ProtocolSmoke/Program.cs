@@ -72,6 +72,8 @@ try
     TestAcknowledgements(settings);
     TestFirmwareCompatibility(settings);
     TestRadioBridge(settings);
+    await TestRemoteSlots(settings);
+    TestRadioFragments();
     await TestWifiManagement(settings);
     await TestWifiDiscovery(settings);
     TestAssignments(settings);
@@ -456,6 +458,78 @@ static void TestRadioBridge(string settings)
         Check(bridge.Closed && !core.Statuses().Single().Online, "Detach must invalidate the radio session");
     }
     Console.WriteLine("PASS ESP-NOW, ESP-NOW LR and BLE bridge routing, signed sessions and peer isolation (simulated serial)");
+}
+
+static async Task TestRemoteSlots(string settings)
+{
+    using var core = new PilotCore(settings, 0);
+    using var stick = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+    string key = core.Devices.Single().Key;
+    string wlan = Connect(stick, core, key, new string('e', 32));
+    void Udp(string body) => Send(stick, core, body, Tag(body, key));
+    Udp($"TP1|link|{id}|{wlan}|1|90|-42|4|20|1");
+    Udp($"TP1|firmware|{id}|{wlan}|{PagerUsb.Version}|remote-slots");
+    Udp($"TP1|slots|{id}|{wlan}|0|0,udp;1,ble;2,espnow,10061c286f4c,6;3,future-mode");
+    core.Tick();
+    var status = core.Statuses().Single();
+    Check(status is { Online: true, Address: "127.0.0.1", ActiveSlot: 0, Slots.Length: 3 },
+        "Authenticated IP and supported profiles must appear in the status");
+
+    DeviceSlot target = status.Slots!.Single(slot => slot.Mode == "ble");
+    Task<string> pending = core.SwitchSlot(id, target);
+    string[] command;
+    do { command = Read(stick, core, key); } while (command[1] != "switch_slot");
+    Check(command[3] == wlan && command[5] == "1", "Switch must be scoped to the old session and chosen slot");
+    Udp($"TP1|slot_result|{id}|{wlan}|{command[4]}|testing");
+    Udp($"TP1|slot_result|{id}|{wlan}|{command[4]}|applied");
+    core.Tick();
+    Check(!pending.IsCompleted, "The source session cannot confirm a successful switch");
+
+    const string mac = "10061c286f4c", nonce = "0123456789abcdef0123456789abcdef";
+    var native = new FakeRadio("ble");
+    core.AttachBluetooth(native);
+    void Ble(string body) => native.Inbound.Enqueue(new(mac, body + "|" + Tag(body, key)));
+    Ble($"TP1|hello|{id}|{nonce}");
+    core.Tick();
+    string radio = native.Outbound.First(frame => frame.Payload.Contains("|offer|")).Payload.Split('|')[4];
+    Ble($"TP1|ready|{id}|{nonce}|{radio}");
+    core.Tick();
+    Check(core.Statuses().Single().ActiveSlot is null, "Profiles must be refreshed in the new session");
+    Ble($"TP1|firmware|{id}|{radio}|{PagerUsb.Version}|remote-slots");
+    Ble($"TP1|slots|{id}|{radio}|1|0,udp;1,ble");
+    Ble($"TP1|slot_result|{id}|{radio}|{command[4]}|applied");
+    Ble($"TP1|link|{id}|{radio}|1|90|-128|4|20|1");
+    core.Tick();
+    Check(await pending.WaitAsync(TimeSpan.FromSeconds(2)) == "applied" &&
+        core.Statuses().Single() is { Transport: "ble", Online: true, Address: "10:06:1C:28:6F:4C", ActiveSlot: 1 },
+        "A signed result on the new BLE session must confirm the switch, address and target profile");
+    core.AttachRadio(new FakeRadio("espnow"));
+    Check(core.Statuses().Single().Online, "Attaching a USB bridge must preserve active native BLE links");
+    var rolledBack = core.SwitchSlot(id, new DeviceSlot(0, "udp"));
+    string switchId = native.Outbound.Last(frame => frame.Payload.Contains("|switch_slot|")).Payload.Split('|')[4];
+    Ble($"TP1|slot_result|{id}|{radio}|{switchId}|rollback");
+    core.Tick();
+    Check(await rolledBack.WaitAsync(TimeSpan.FromSeconds(2)) == "rollback",
+        "The Core must report a rollback without switching its device status");
+    core.AttachBluetooth(null);
+    Check(core.Statuses().Single() is { Online: false, LastKnownAddress: true }, "Detached stick retains its last address");
+    Console.WriteLine("PASS Remote profiles, session-bound migration, rollback and parallel BLE/USB transport");
+}
+
+static void TestRadioFragments()
+{
+    string payload = "TP1|" + new string('a', 896);
+    byte[][] frames = RadioFragments.Encode(payload, 0xabcd).ToArray();
+    Check(frames.Length == 5 && frames[0].Take(8).SequenceEqual(new byte[] { 0x54, 0x50, 0x52, 0x31, 0xcd, 0xab, 0, 5 }),
+        "Windows must use the same little-endian fragment layout as the ESP32");
+    var radio = new RadioFragments();
+    Check(radio.Receive(frames[1], 1) is null && radio.Receive(frames[0], 2) is null &&
+        radio.Receive(frames[1], 360) is null, "Unstarted or expired sequences must be ignored");
+    for (int i = 0; i < frames.Length - 1; i++)
+        Check(radio.Receive(frames[i], 400 + i) is null, "Incomplete sequences must not reach the Core");
+    Check(radio.Receive(frames[^1], 405) == payload && radio.Receive(frames[^1], 406) is null,
+        "Five fragments must reassemble exactly once");
+    Console.WriteLine("PASS BLE packet layout, fragmentation and incomplete sequences");
 }
 
 static async Task TestWifiManagement(string settings)

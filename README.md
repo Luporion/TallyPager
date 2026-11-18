@@ -1,11 +1,11 @@
-# TallyPager 0.7.0
+# TallyPager 0.8.0
 
 Tally und Chat für mobile Kameras mit dem M5StickC Plus2. Die Windows-App kann ATEM und vMix direkt lesen oder Tally Arbiter als Quelle verwenden. CameraCue 0.1.4 bleibt als eigener [Build für Tally Arbiter](CameraCue/README.md) verfügbar.
 
 ## Start und Einrichtung
 
-1. Für die portable Variante `TallyPager-Windows-x64.exe` und `TallyPager-Firmware-M5StickC-Plus2-0.7.0.zip` aus `dist/0.7.0/` in denselben Ordner legen. Für die installierbare Variante `TallyPager-Setup-Windows-x64.exe` starten. Setup installiert die App samt Firmwarepaket für das Windows-Benutzerkonto und legt einen Startmenüeintrag an. Auch spätere Setup-Versionen aktualisieren diese Installation. Die App benötigt keine separate .NET-Installation.
-2. Unter **Stick einrichten/verwalten → USB** den Port, die IPv4-Adresse des PCs im Kameranetz und den Sticknamen wählen. Firmwareversion und Funktionen lassen sich mit **Firmware lesen** prüfen. **Firmware aktualisieren** verwendet das separate ZIP und prüft vor dem Flashen Modell, Version und Prüfsummen. **Stick einrichten** verwendet die bereits installierte Firmware, soweit sie den gewählten Modus unterstützt.
+1. Für die portable Variante `TallyPager-Windows-x64.exe` und `TallyPager-Firmware-M5StickC-Plus2-0.8.0.zip` aus `dist/0.8.0/` in denselben Ordner legen. Für die installierbare Variante `TallyPager-Setup-Windows-x64.exe` starten. Setup installiert die App samt Firmwarepaket für das Windows-Benutzerkonto und legt einen Startmenüeintrag an. Auch spätere Setup-Versionen aktualisieren diese Installation. Die App läuft ab Windows 10 Version 2004 und benötigt keine separate .NET-Installation.
+2. Unter **Stick einrichten/verwalten → USB** den Port, die **Adresse des Basis-Servers** im Kameranetz und den Sticknamen wählen. Firmwareversion und Funktionen lassen sich mit **Firmware lesen** prüfen. **Firmware aktualisieren** verwendet das separate ZIP und prüft vor dem Flashen Modell, Version und Prüfsummen. **Stick einrichten** verwendet die bereits installierte Firmware, soweit sie den gewählten Modus unterstützt.
 3. WLAN-Name und Passwort eingeben oder beide Felder für das gespeicherte WLAN leer lassen. Der Stick benötigt ein 2,4-GHz-WLAN und muss den PC per UDP auf Port 46224 erreichen.
 4. Unter **Externe Verbindungen → Mixer und Zuordnung** die gewünschten Quellen verbinden. Einen Stick in der Tabelle auswählen, pro Ebene Quelle und Eingang wählen und die Zuordnung speichern. **Aus · ausblenden** entfernt Farbe und Quellzeile für diese Ebene. **Innen und außen tauschen** speichert den Tausch sofort. Der Stick zeigt die zugeordnete Quelle an, zum Beispiel `ATEM: LIVE`.
 5. Unter **Regie** einen oder mehrere Sticks auswählen. **Enter** sendet den Inhalt der gerade bearbeiteten Zeile. Jede Zeile hat **Leeren** und **Senden**. **Chat und Next senden** überträgt beide Felder. Einzelaktionen erhalten den jeweils anderen Text pro Stick.
@@ -33,16 +33,25 @@ Der Updater lädt aus den öffentlichen [TallyPager-Releases](https://github.com
 - Auf jedem M5StickC Plus2 können durch USB-Einrichtung bis zu vier **Geräteprofile** vorbereitet werden. Jedes Profil speichert auch WLAN, Core-Adresse und Funkmodus. Beide Tasten rund zwei Sekunden halten, beide loslassen und mit **A** das Profil wählen. **B** bestätigt den Wechsel. Das Gerät startet mit dem gewählten Profil neu.
 - Unter **Regie → Stick-Vorschau anzeigen** zeigt die App für den ausgewählten Stick ihren letzten Anzeigezustand und dessen Bestätigung. Eine USB-Funkbasis mit Firmware 0.7.0 zeigt bis zu vier über ihren Modus verwaltete Pager. Der Core überträgt die lokale PC-Uhrzeit über den aktiven Tally-Funkweg.
 
+### Funkmodus ohne USB wechseln
+
+1. Den Pager einmal per USB auf Firmware **0.8.0** aktualisieren. Unter **Stick einrichten/verwalten → USB** pro gewünschtem Funkmodus ein anderes **Geräteprofil am Stick** speichern. Der Stick startet nach jedem Speichern im gerade bearbeiteten Profil. Der zuletzt eingerichtete Modus dient als Ausgangspunkt.
+2. Die Verbindungen für beide Modi bereitstellen. Bei WLAN + UDP muss der Stick den Basis-Server im gespeicherten Netz erreichen. Bei BLE **Einstellungen Funkbasis-Modus → BLE direkt verbinden** oder eine USB-BLE-Funkbasis verwenden. Bei ESP-NOW und ESP-NOW LR müssen Adresse, Kanal und Modus der USB-Basis zum Zielprofil passen.
+3. Oben den Stick auswählen, **Stick einrichten/verwalten → Funkmodus wechseln** öffnen, das gewünschte **Geräteprofil** wählen und **Ausgewählten Stick umstellen** drücken. **Alle erreichbaren Sticks umstellen** wechselt eine Flotte zu einem Zielmodus. Sticks mit mehreren passenden Profilen lassen sich einzeln umstellen. Die Ergebnisliste zeigt für jeden betroffenen Stick den bestätigten Wechsel, einen Rückfall oder die Ursache, warum er übersprungen wurde.
+4. Der Pager startet neu und wartet bis zu 30 Sekunden auf Tally vom authentifizierten Basis-Server. Wenn es ankommt, übernimmt er das Profil dauerhaft. Sonst startet er wieder im vorherigen Profil. Die Funkbasis bleibt für ESP-NOW und ESP-NOW LR separat unter **Einstellungen Funkbasis-Modus** umstellbar.
+
 ## Funkmodi und WLAN-Verwaltung
 
 | Modus | Aufbau |
 | --- | --- |
-| **WLAN + UDP** | Der bisherige Modus der Windows-App. Stick und Regie-PC brauchen ein erreichbares lokales Netz. UDP 46224 trägt Tally, Chat, Status und Quittierungen. |
+| **WLAN + UDP** | Verwendet die Windows-Netzwerkadapter. Stick und Basis-Server brauchen ein erreichbares lokales Netz. UDP 46224 trägt Tally, Chat, Status und Quittierungen. |
 | **ESP-NOW** | Ein zweiter M5StickC Plus2 bleibt per USB als Funkbasis am Regie-PC. Basis und Pager brauchen denselben Kanal und der Pager die Adresse der Funkbasis. |
 | **ESP-NOW LR** | Gleicher Aufbau mit dem Espressif-LR-Modus auf beiden Geräten. Die Reichweite im Saal muss gemessen werden. |
-| **BLE** | Die USB-Funkbasis sucht BLE-Pager automatisch und verwendet BLE GATT. Die Windows-App braucht dabei keinen Bluetooth-Adapter. |
+| **BLE** | Windows-Bluetooth-LE-Adapter oder USB-BLE-Funkbasis. Unter **Einstellungen Funkbasis-Modus → BLE direkt verbinden** sucht und verbindet die App BLE-Pager über den Windows-Adapter. Eine ESP-NOW-Funkbasis und WLAN-Pager können parallel laufen. |
 
 Die eigenständige Windows-App nutzt die obigen Modi. Die ältere CameraCue-Firmware mit Tally Arbiter nutzt WebSocket und bleibt als eigenes Paket verfügbar.
+
+In der Tabelle zeigt **Adresse** die IPv4-Adresse bzw. die Bluetooth- oder ESP-NOW-Adresse des Sticks. Bei getrennten Geräten bleibt die letzte bekannte Adresse sichtbar. Unten rechts stehen die aktiven Netzwerkadapter des Basis-Servers und ihre IPv4-Adressen. Ein Klick zeigt die komplette Liste inklusive IPv6 und inaktiver Adapter.
 
 1. **Einstellungen Funkbasis-Modus** öffnen, den USB-Port der Basis und ESP-NOW, ESP-NOW LR oder BLE auswählen. **Stick als Funkbasis einrichten**, anschließend **Funkbasis verbinden**. Dieselbe Firmware-ZIP enthält beide Rollen. **Wieder als Pager starten** übernimmt die vorher auf dem Gerät gespeicherte Pager-Konfiguration, sofern eine vorhanden ist.
 2. Einen weiteren Stick für die Kamerarolle per USB verbinden. Unter **Stick einrichten/verwalten → USB** denselben Funkmodus wählen. Bei ESP-NOW und ESP-NOW LR übernimmt die App von einer angeschlossenen Basis deren Adresse und Kanal in die USB-Einrichtung. Bei BLE findet die Basis den Pager automatisch. Eine USB-Basis kann einen Modus gleichzeitig bedienen. WLAN-Pager können parallel verbunden bleiben.

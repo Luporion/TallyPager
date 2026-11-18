@@ -19,7 +19,7 @@ constexpr size_t maxPacket = 900;
 constexpr char hexDigits[] = "0123456789abcdef";
 constexpr const char* firmwareFeatures[] = {"usb-config", "chat-ack", "link-stats", "diagnostics",
     "wifi-config", "wifi-discovery", "radio-base", "espnow", "espnow-lr", "ble",
-    "usb-read-settings", "clock", "device-slots", "base-preview"};
+    "usb-read-settings", "clock", "device-slots", "base-preview", "remote-slots"};
 WiFiUDP udp, management;
 IPAddress core;
 String deviceId, name, ssid, password, nonce, session, cue, next, serialLine;
@@ -53,6 +53,8 @@ int rtt = -1;
 bool configured = false, udpReady = false, diagnostics = false, dirty = true, serialOverflow = false;
 bool testMode = false;
 int activeSlot = 0, chosenSlot = -1;
+String slotRequest, slotOutcome, trialConfig;
+uint32_t trialDeadline = 0;
 uint32_t menuHeld = 0, menuTouched = 0, clockAt = 0, clockSeconds = 0;
 int lastMinute = -1;
 bool clockSynced = false, menuArmed = false, menuAttempted = false;
@@ -64,6 +66,9 @@ uint32_t baseViewAt = 0;
 void reportConfig();
 void handleConfig(String* fields, size_t count, uint32_t now, uint32_t& lastCounter);
 void updateConfig(uint32_t now);
+void reportSlots();
+void handleSlot(const String& request, const String& slot, uint32_t now);
+void updateSlotTrial(uint32_t now);
 
 String hex(const uint8_t* bytes, size_t size) {
   String result;
@@ -210,6 +215,10 @@ void receive(uint32_t now) {
       dirty = true;
     }
     if (session.isEmpty() || count < 5 || fields[3] != session) continue;
+    if (count == 6 && fields[1] == "switch_slot" && sequence) {
+      handleSlot(fields[4], fields[5], now);
+      continue;
+    }
     if (count == 5 && fields[1] == "clock") {
       char* end = nullptr;
       const char* value = fields[4].c_str();
@@ -222,7 +231,7 @@ void receive(uint32_t now) {
       }
       continue;
     }
-    if (mode == "udp" && fields[1] == "cfg" && sequence) {
+    if (mode == "udp" && fields[1] == "cfg" && sequence && trialConfig.isEmpty() && !restartAt) {
       handleConfig(fields, count, now, configCounter);
       continue;
     }
@@ -323,6 +332,7 @@ void network(uint32_t now) {
     if (lastDiagnostic == 0 || now - lastDiagnostic >= 5000) {
       send("TP1|caps|" + deviceId + "|" + session + "|ack");
       send(firmwareMessage(session));
+      reportSlots();
       if (mode == "udp") reportConfig();
       send("TP1|diag|" + deviceId + "|" + session + "|" + String(wifiLoss.load()) + "|" +
            String(snapshotLoss) + "|" + String(wifiReason.load()) + "|" + String(lastStaleAge) +
@@ -402,6 +412,99 @@ bool settings(JsonDocument& doc, bool persist, bool apply = true) {
   return true;
 }
 
+void reportSlotResult() {
+  if (sequence && !slotRequest.isEmpty() && !slotOutcome.isEmpty())
+    send("TP1|slot_result|" + deviceId + "|" + session + "|" + slotRequest + "|" + slotOutcome);
+}
+
+void reportSlots() {
+  Preferences prefs;
+  if (!prefs.begin("tallypilot", true)) return;
+  String entries;
+  for (int slot = 0; slot < 4; ++slot) {
+    JsonDocument doc;
+    if (deserializeJson(doc, prefs.getString(slotKey(slot).c_str(), "")) ||
+        !settings(doc, false, false) || doc["slot"].as<int>() != slot ||
+        String(doc["key"] | "") != hex(key, sizeof(key))) continue;
+    String target = doc["mode"] | "udp";
+    if (entries.length()) entries += ';';
+    entries += String(slot) + "," + target;
+    if (target == "espnow" || target == "espnow-lr")
+      entries += "," + String(doc["gateway"] | "") + "," + String(doc["channel"] | 6);
+  }
+  prefs.end();
+  send("TP1|slots|" + deviceId + "|" + session + "|" + String(activeSlot) + "|" + entries);
+  reportSlotResult();
+}
+
+void handleSlot(const String& request, const String& slot, uint32_t now) {
+  uint8_t token[16];
+  if (!unhex(request, token, sizeof(token)) || slot.length() != 1 || slot[0] < '0' || slot[0] > '3') return;
+  if (slotRequest == request) { reportSlotResult(); return; }
+  if (!trialConfig.isEmpty() || restartAt || wifiTrial || configSwitchAt || chosenSlot >= 0) {
+    send("TP1|slot_result|" + deviceId + "|" + session + "|" + request + "|rejected");
+    return;
+  }
+  int selected = slot[0] - '0';
+  bool prepared = false;
+  Preferences prefs;
+  if (selected != activeSlot && prefs.begin("tallypilot", false)) {
+    JsonDocument doc;
+    String candidate = prefs.getString(slotKey(selected).c_str(), "");
+    String marker = request + slot;
+    if (!deserializeJson(doc, candidate) && settings(doc, false, false) &&
+        doc["slot"].as<int>() == selected && String(doc["key"] | "") == hex(key, sizeof(key)) &&
+        prefs.putString("slotRequest", request) == request.length())
+      prepared = prefs.putString("slotTrial", marker) == marker.length();
+    prefs.end();
+  }
+  slotRequest = request;
+  slotOutcome = prepared ? "testing" : "rejected";
+  reportSlotResult();
+  if (prepared) restartAt = now + 600;
+}
+
+void loadSlotTrial(Preferences& prefs, JsonDocument& current) {
+  slotRequest = prefs.getString("slotRequest", "");
+  if (slotRequest.isEmpty()) return;
+  slotOutcome = String(current["switchRequest"] | "") == slotRequest ? "applied" : "rollback";
+  if (!prefs.isKey("slotTrial")) return;
+  String marker = prefs.getString("slotTrial", "");
+  // Consume the trial before using it. Any reset before commit returns to the last saved profile.
+  if (!prefs.remove("slotTrial") || marker.length() != 33 || !marker.startsWith(slotRequest) ||
+      marker[32] < '0' || marker[32] > '3') return;
+  int selected = marker[32] - '0';
+  JsonDocument candidate;
+  if (deserializeJson(candidate, prefs.getString(slotKey(selected).c_str(), "")) ||
+      candidate["slot"].as<int>() != selected || String(candidate["key"] | "") != hex(key, sizeof(key)) ||
+      !settings(candidate, false)) return;
+  candidate["switchRequest"] = slotRequest;
+  serializeJson(candidate, trialConfig);
+  trialDeadline = millis() + 30000;
+  slotOutcome = "";
+}
+
+void updateSlotTrial(uint32_t now) {
+  if (trialConfig.isEmpty()) return;
+  if (sequence && !restartAt) {
+    Preferences prefs;
+    if (prefs.begin("tallypilot", false)) {
+      bool committed = prefs.putString("config", trialConfig) == trialConfig.length();
+      prefs.end();
+      if (committed) {
+        trialConfig = "";
+        slotOutcome = "applied";
+        reportSlots();
+        dirty = true;
+        return;
+      }
+    }
+    restartAt = now + 100;
+  } else if (static_cast<int32_t>(now - trialDeadline) >= 0 && !restartAt) {
+    restartAt = now + 100;
+  }
+}
+
 void connectWifi() {
   if (ssid.isEmpty()) WiFi.begin();
   else {
@@ -427,7 +530,7 @@ void reportConfig() {
 }
 
 void manageWifi(uint32_t now) {
-  if (mode != "udp" || !configured || baseRole) return;
+  if (mode != "udp" || !configured || baseRole || !trialConfig.isEmpty() || restartAt) return;
   if (!managementSession.isEmpty() && now - managementTime >= 90000) managementSession = "";
   if (WiFi.status() != WL_CONNECTED) {
     if (managementReady) management.stop();
@@ -859,6 +962,7 @@ void draw() {
 }
 
 void setup() {
+  Serial.setRxBufferSize(2048);
   Serial.begin(115200);
   StickCP2.begin(M5.config());
   StickCP2.Display.setRotation(1);
@@ -872,13 +976,14 @@ void setup() {
   radioMac = radio::formatAddress(macAddress);
   name = "TallyPager";
   Preferences prefs;
-  if (prefs.begin("tallypilot", true)) {
+  if (prefs.begin("tallypilot", false)) {
     String json = prefs.getString("config", "");
     String base = prefs.getString("base", "");
-    prefs.end();
     JsonDocument doc;
     configured = !deserializeJson(doc, json) && settings(doc, false);
     if (base.length() && !deserializeJson(doc, base)) baseConfig(doc, false);
+    if (configured && !baseRole) loadSlotTrial(prefs, doc);
+    prefs.end();
   }
   if (baseRole || (configured && mode != "udp")) {
     radio::start(mode, radioChannel, baseRole, gatewayAddress);
@@ -905,7 +1010,7 @@ void setup() {
 }
 
 bool profileButtons(uint32_t now) {
-  if (!configured || baseRole) return false;
+  if (!configured || baseRole || !trialConfig.isEmpty() || restartAt) return false;
   bool both = M5.BtnA.isPressed() && M5.BtnB.isPressed();
   if (chosenSlot < 0 && both) {
     if (!menuHeld) menuHeld = now;
@@ -972,6 +1077,7 @@ void loop() {
     }
   } else {
     network(now);
+    updateSlotTrial(now);
     manageWifi(now);
     updateConfig(now);
   }

@@ -20,7 +20,7 @@ internal sealed record UsbSettings(string Id, string Name, string Host, string S
 
 internal static class PagerUsb
 {
-    public const string Version = "0.7.0";
+    public const string Version = "0.8.0";
     public const string FirmwareFileName = "TallyPager-Firmware-M5StickC-Plus2-" + Version + ".zip";
     private const string StatusPrefix = "TP ";
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
@@ -37,7 +37,7 @@ internal static class PagerUsb
         while (timer.Elapsed < timeout)
         {
             serial.WriteLine("TP STATUS");
-            var reply = ReadReply(serial, TimeSpan.FromMilliseconds(420));
+            var reply = ReadReply(serial, TimeSpan.FromMilliseconds(420), "TP {");
             if (reply?.StartsWith("TP {", StringComparison.Ordinal) == true)
             {
                 if (ParseStatus(reply) is { } status) return status;
@@ -67,7 +67,7 @@ internal static class PagerUsb
             var current = ReadStatus(serial, TimeSpan.FromSeconds(4));
             if (current.Id != pager.Id) throw new InvalidOperationException("Am USB-Port antwortet inzwischen ein anderer Stick.");
             serial.WriteLine(ConfigCommand(current, pager, host, ssid, password, mode, gateway, channel, slot));
-            if (ReadReply(serial, TimeSpan.FromSeconds(4)) != "TP OK")
+            if (ReadReply(serial, TimeSpan.FromSeconds(4), "TP OK", "TP ERROR ") != "TP OK")
                 throw new InvalidOperationException("Der Stick hat die Einstellungen nicht bestätigt.");
         }
         Thread.Sleep(1400);
@@ -100,7 +100,7 @@ internal static class PagerUsb
             throw new InvalidOperationException("Stick-Einstellungen lassen sich ab Firmware 0.7.0 per USB auslesen.");
         serial.WriteLine("TP READ SETTINGS");
         const string prefix = "TP SETTINGS ";
-        var line = ReadReply(serial, TimeSpan.FromSeconds(4), prefix);
+        var line = ReadReply(serial, TimeSpan.FromSeconds(4), prefix, "TP ERROR read");
         if (line?.StartsWith(prefix, StringComparison.Ordinal) == true && line.Length < 4096)
         {
             var data = JsonSerializer.Deserialize<UsbSettings>(line[prefix.Length..], Json);
@@ -128,7 +128,7 @@ internal static class PagerUsb
             if (current.Id != id || !supports(current))
                 throw new InvalidOperationException("Der Stick am USB-Port unterstützt diese Rollenänderung nicht.");
             serial.WriteLine(command);
-            if (ReadReply(serial, TimeSpan.FromSeconds(4)) != "TP OK")
+            if (ReadReply(serial, TimeSpan.FromSeconds(4), "TP OK", "TP ERROR ") != "TP OK")
                 throw new InvalidOperationException("Der Stick hat die Rolle nicht bestätigt.");
         }
         Thread.Sleep(1400);
@@ -268,7 +268,7 @@ internal static class PagerUsb
         catch { serial.Dispose(); throw; }
     }
 
-    private static string? ReadReply(SerialPort port, TimeSpan timeout, string? prefix = null)
+    private static string? ReadReply(SerialPort port, TimeSpan timeout, params string[] prefixes)
     {
         var timer = Stopwatch.StartNew();
         while (timer.Elapsed < timeout)
@@ -276,9 +276,7 @@ internal static class PagerUsb
             try
             {
                 string line = port.ReadLine().Trim();
-                if ((prefix is null || line.StartsWith(prefix, StringComparison.Ordinal) || line == "TP ERROR read") &&
-                    line.StartsWith(StatusPrefix, StringComparison.Ordinal) &&
-                    !line.StartsWith("TP LINK ", StringComparison.Ordinal)) return line;
+                if (prefixes.Any(prefix => line.StartsWith(prefix, StringComparison.Ordinal))) return line;
             }
             catch (TimeoutException) { }
         }

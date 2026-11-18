@@ -1,6 +1,5 @@
 using System.IO.Ports;
 using System.Net;
-using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text;
 using System.Diagnostics;
@@ -108,11 +107,12 @@ internal sealed partial class MainWindow : Form
         BackColor = Color.FromArgb(241, 245, 249);
         ForeColor = Color.FromArgb(22, 34, 49);
 
-        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(16), ColumnCount = 1, RowCount = 4 };
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(16), ColumnCount = 1, RowCount = 5 };
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 165));
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         var header = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, AutoSize = true };
         header.ColumnStyles.Add(new(SizeType.Percent, 100));
         header.ColumnStyles.Add(new(SizeType.AutoSize));
@@ -128,9 +128,10 @@ internal sealed partial class MainWindow : Form
         selectedFirmware.Margin = new Padding(3, 3, 3, 7);
         layout.Controls.Add(selectedFirmware, 0, 2);
         layout.Controls.Add(tabs, 0, 3);
+        layout.Controls.Add(NetworkFooter(), 0, 4);
         Controls.Add(layout);
 
-        foreach (string column in new[] { "Stick", "Modus", "Innen", "Außen", "Verbindung", "WLAN", "RTT", "Akku", "Anzeige", "Chat", "Firmware" })
+        foreach (string column in new[] { "Stick", "Modus", "Innen", "Außen", "Verbindung", "WLAN", "RTT", "Akku", "Anzeige", "Chat", "Firmware", "Adresse" })
         {
             int index = devices.Columns.Add(column, column);
             devices.Columns[index].SortMode = DataGridViewColumnSortMode.NotSortable;
@@ -140,6 +141,8 @@ internal sealed partial class MainWindow : Form
         devices.Columns[6].FillWeight = 65;
         devices.Columns[7].FillWeight = 60;
         devices.Columns["Firmware"]!.FillWeight = 120;
+        devices.Columns["Adresse"]!.FillWeight = 165;
+        devices.Columns["Adresse"]!.MinimumWidth = 122;
 
         tabs.TabPages.AddRange([overview, sources, simulation, setup]);
         AddOverview();
@@ -151,8 +154,7 @@ internal sealed partial class MainWindow : Form
         LoadSources();
         ConnectProfileSources();
         ScanPorts();
-        foreach (string address in FindAddresses()) addresses.Items.Add(address);
-        if (addresses.Items.Count > 0) addresses.SelectedIndex = 0;
+        RefreshNetworkFooter();
         string localFirmware = Path.Combine(AppContext.BaseDirectory, PagerUsb.FirmwareFileName);
         if (File.Exists(localFirmware)) firmware.Text = localFirmware;
         RefreshRows();
@@ -260,20 +262,23 @@ internal sealed partial class MainWindow : Form
         var header = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, Padding = new Padding(20, 9, 0, 0) };
         var method = Choices();
         method.AccessibleName = "Verbindungsart";
-        method.Items.AddRange(["USB", "WLAN"]);
+        method.Width = 175;
+        method.Items.AddRange(["USB", "WLAN", "Funkmodus wechseln"]);
         header.Controls.Add(new Label { Text = "Verbindungsart", AutoSize = true, Margin = new Padding(0, 7, 12, 0) });
         header.Controls.Add(method);
         page.Controls.Add(header, 0, 0);
         var content = new Panel { Dock = DockStyle.Fill };
         var usb = new Panel { Dock = DockStyle.Fill };
         var wireless = new Panel { Dock = DockStyle.Fill };
-        content.Controls.AddRange([wireless, usb]);
+        var remote = new Panel { Dock = DockStyle.Fill };
+        content.Controls.AddRange([remote, wireless, usb]);
         page.Controls.Add(content, 0, 1);
         method.SelectedIndexChanged += (_, _) =>
         {
             wifiSetupSelected = method.SelectedIndex == 1;
-            usb.Visible = !wifiSetupSelected;
+            usb.Visible = method.SelectedIndex == 0;
             wireless.Visible = wifiSetupSelected;
+            remote.Visible = method.SelectedIndex == 2;
             RefreshConnectionTools();
         };
 
@@ -286,7 +291,7 @@ internal sealed partial class MainWindow : Form
         Full(grid, usbFirmware);
         Row(grid, "Firmwarepaket", firmware, Action("ZIP auswählen", (_, _) => SelectFirmware()));
         Row(grid, "Funkmodus", pagerTransport);
-        Row(grid, "Adresse dieses PCs", addresses);
+        Row(grid, "Adresse des Basis-Servers", addresses);
         Row(grid, "Name des Sticks", pagerName);
         Row(grid, "WLAN-Name", ssid);
         Row(grid, "WLAN-Passwort", password, Reveal(password));
@@ -303,6 +308,7 @@ internal sealed partial class MainWindow : Form
         pagerTransport.SelectedIndexChanged += (_, _) => UpdateProvisionFields();
         pagerTransport.SelectedIndex = 0;
         AddWifiSetup(wireless);
+        AddRemoteModes(remote);
         method.SelectedIndex = 0;
     }
 
@@ -652,6 +658,7 @@ internal sealed partial class MainWindow : Form
             if (now - lastUi < 250) return;
             lastUi = now;
             if (now - lastPortScan >= 1000) ScanPorts();
+            if (now - lastAdapterScan >= 5000) RefreshNetworkFooter();
             UpdateMixerUi(a, v, ta);
             RefreshRows();
             RefreshDiagnostics(v);
@@ -715,7 +722,7 @@ internal sealed partial class MainWindow : Form
                 connection, status.Rssi is int rssi ? $"{WifiBars(rssi)}/4 · {rssi} dBm" : "—",
                 status.Rtt is int rtt ? $"{rtt} ms" : "—", status.Online && status.Battery is int battery ? $"{battery} %" : "—",
                 status.PreviewReceived ? "Bestätigt" : "—", OperatorSession.Delivery(status),
-                status.Firmware?.ShortVersion ?? "—"];
+                status.Firmware?.ShortVersion ?? "—", status.Address ?? "—"];
             for (int i = 0; i < values.Length; i++)
                 if (!Equals(row.Cells[i].Value, values[i])) row.Cells[i].Value = values[i];
             row.Cells[4].Style.ForeColor = status.Connection switch
@@ -723,6 +730,9 @@ internal sealed partial class MainWindow : Form
                 Connection.Connected => Color.DarkGreen, Connection.Delayed => Color.SaddleBrown, _ => Color.DimGray
             };
             row.Cells["Firmware"].ToolTipText = status.Firmware?.Description ?? "Firmware noch nicht gemeldet.";
+            row.Cells["Adresse"].Style.ForeColor = status.LastKnownAddress ? Color.DimGray : devices.ForeColor;
+            row.Cells["Adresse"].ToolTipText = status.LastKnownAddress ? "Zuletzt gemeldete Adresse" :
+                status.Transport == "udp" ? "IPv4-Adresse des Sticks" : "Funkadresse des Sticks";
         }
         ShowSelectedFirmware();
     }
@@ -763,14 +773,6 @@ internal sealed partial class MainWindow : Form
             else if (added is [var onlyNew]) picker.SelectedItem = onlyNew;
         }
     }
-
-    private static IEnumerable<string> FindAddresses() => NetworkInterface.GetAllNetworkInterfaces()
-        .Where(adapter => adapter.OperationalStatus == OperationalStatus.Up)
-        .SelectMany(adapter => adapter.GetIPProperties().UnicastAddresses)
-        .Select(item => item.Address)
-        .Where(ip => ip.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(ip))
-        .Select(ip => ip.ToString()).Distinct()
-        .OrderByDescending(ip => ip.StartsWith("192.168.", StringComparison.Ordinal));
 
     private static ComboBox Choices(bool editable = false) => new()
         { DropDownStyle = editable ? ComboBoxStyle.DropDown : ComboBoxStyle.DropDownList };

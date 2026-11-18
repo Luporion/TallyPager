@@ -11,6 +11,7 @@
     <Compile Include="../../desktop/LocalSecret.cs" Link="LocalSecret.cs" />
     <Compile Include="../../desktop/Profiles.cs" Link="Profiles.cs" />
     <Compile Include="../../desktop/RadioBridge.cs" Link="RadioBridge.cs" />
+    <Compile Include="../../desktop/RadioFragments.cs" Link="RadioFragments.cs" />
     <Compile Include="../../desktop/WifiManagement.cs" Link="WifiManagement.cs" />
     <Compile Include="../../desktop/DiagnosticLog.cs" Link="DiagnosticLog.cs" />
     <Compile Include="../../desktop/GitHubUpdates.cs" Link="GitHubUpdates.cs" />

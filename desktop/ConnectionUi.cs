@@ -68,7 +68,7 @@ internal sealed partial class MainWindow
             AutoSize = true, MaximumSize = new Size(700, 0),
             Text = "Die Funkbasis bleibt per USB am Rechner. Verbinde einen weiteren Stick zum Einrichten mit USB und wähle dort denselben Funkmodus. ESP-NOW nutzt auf beiden Sticks denselben Kanal und die Adresse der Basis. BLE sucht die Pager automatisch."
         });
-
+        AddWindowsBluetoothControls(setupBase);
     }
 
     private void AddWifiSetup(Control panel)
@@ -94,7 +94,7 @@ internal sealed partial class MainWindow
         Full(remote, wifiDetails);
         Full(remote, Action("Einstellungen laden", (_, _) => LoadWifi()));
         Row(remote, "Name des Sticks", wifiName);
-        Row(remote, "PC-Adresse am Stick", wifiHost);
+        Row(remote, "Adresse des Basis-Servers", wifiHost);
         Row(remote, "Neuer WLAN-Name", wifiNetwork);
         Row(remote, "Neues WLAN-Passwort", wifiPassword, Reveal(wifiPassword));
         wifiApply.Enabled = false;
@@ -130,7 +130,7 @@ internal sealed partial class MainWindow
 
     private async Task InspectUsb(ComboBox picker, Label label)
     {
-        if (busy) return;
+        if (busy || changingModes) return;
         if (picker.SelectedItem is not string port) { label.Text = "USB-Port auswählen."; return; }
         busy = true;
         try { await ReadUsbFirmware(port, label); }
@@ -180,14 +180,21 @@ internal sealed partial class MainWindow
 
     private async Task ConnectBase()
     {
-        if (busy) return;
+        if (busy || changingModes) return;
         if (activeRadio is not null) { DisconnectBase("Funkbasis getrennt."); return; }
         if (basePort.SelectedItem is not string port) { baseStatus.Text = "USB-Port der Funkbasis auswählen."; return; }
         busy = true;
         try
         {
             baseStatus.Text = "Funkbasis wird geprüft …";
-            activeRadio = await Task.Run(() => RadioBridge.Connect(port));
+            var bridge = await Task.Run(() => RadioBridge.Connect(port));
+            if (bridge.Mode == "ble" && windowsBluetooth is not null)
+            {
+                bridge.Dispose();
+                baseStatus.Text = "BLE direkt über Windows zuerst trennen.";
+                return;
+            }
+            activeRadio = bridge;
             core.AttachRadio(activeRadio);
             baseLink!.Text = "Funkbasis trennen";
             var baseInfo = activeRadio.Status;
@@ -213,7 +220,7 @@ internal sealed partial class MainWindow
 
     private async Task ConfigureBase(bool restore)
     {
-        if (busy) return;
+        if (busy || changingModes) return;
         if (basePort.SelectedItem is not string port) { baseStatus.Text = "USB-Port der Funkbasis auswählen."; return; }
         if (activeRadio?.Port == port) DisconnectBase("Funkbasis getrennt.");
         busy = true;
@@ -237,13 +244,15 @@ internal sealed partial class MainWindow
         finally { busy = false; }
     }
 
-    private PagerStatus? SelectedWifi()
+    private PagerStatus? SelectedPager()
     {
         return SelectedIds() is [var id] ? core.Statuses().FirstOrDefault(item => item.Id == id) : null;
     }
 
     private void RefreshConnectionTools()
     {
+        RefreshWindowsBluetooth();
+        if (tabs.SelectedTab == setup && remoteProfile.Visible) RefreshRemoteModes();
         if (activeRadio?.Failure is { } failure) DisconnectBase("USB-Funkbasis getrennt · " + failure);
         if (activeRadio is { } bridge && Environment.TickCount64 - lastBasePreview >= 1000)
         {
@@ -251,7 +260,7 @@ internal sealed partial class MainWindow
             bridge.SendBaseView(core.Statuses());
         }
         if (tabs.SelectedTab != setup || !wifiSetupSelected) return;
-        var selected = SelectedWifi();
+        var selected = SelectedPager();
         wifiDetails.Text = selected is { Settings: { } settings }
             ? $"{settings.Name} · Stick-IP {settings.StickIp} · Firmware {settings.Version} · WLAN {(settings.Ssid.Length > 0 ? settings.Ssid : "gespeichert")}"
             : "Einen erreichbaren, gepaarten WLAN-Stick mit Firmware 0.6.0 oder neuer auswählen.";
@@ -261,7 +270,7 @@ internal sealed partial class MainWindow
     private void LoadWifi()
     {
         if (wifiEditing) return;
-        if (SelectedWifi() is not { Settings: { } settings } selected)
+        if (SelectedPager() is not { Settings: { } settings } selected)
         {
             wifiStatus.Text = "Der ausgewählte Stick hat keine WLAN-Einstellungen gemeldet.";
             return;
@@ -277,13 +286,13 @@ internal sealed partial class MainWindow
 
     private async Task ApplyWifi()
     {
-        if (wifiEditing || SelectedWifi() is not { Settings: not null } selected || selected.Id != wifiDevice) return;
+        if (wifiEditing || SelectedPager() is not { Settings: not null } selected || selected.Id != wifiDevice) return;
         string host = wifiHost.Text.Trim();
         if (WifiManagement.ValidHost(host)) host = System.Net.IPAddress.Parse(host).ToString();
         var change = new WifiChange(wifiName.Text.Trim(), host, wifiNetwork.Text, wifiPassword.Text);
         if (!WifiManagement.Valid(change))
         {
-            wifiStatus.Text = "Name, PC-IPv4 oder WLAN-Daten prüfen.";
+            wifiStatus.Text = "Namen, Basis-Server-Adresse oder WLAN-Daten prüfen.";
             return;
         }
         wifiEditing = true;
