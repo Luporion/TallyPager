@@ -9,7 +9,7 @@ $firmware = Join-Path $firmwareBuild 'tallypager-pilot'
 $bundle = Join-Path $PSScriptRoot 'obj/bundle'
 $firmwarePackage = Join-Path $PSScriptRoot 'obj/firmware-package'
 $tools = Join-Path $PSScriptRoot 'obj/esptool'
-$version = '0.9.0'
+$version = '0.10.0'
 $output = Join-Path $project "dist/$version"
 $zip = Join-Path $tools 'esptool-v5.1.0-windows-amd64.zip'
 $platformHome = if ($env:PLATFORMIO_CORE_DIR) { $env:PLATFORMIO_CORE_DIR } else { Join-Path $env:USERPROFILE '.platformio' }
@@ -19,7 +19,7 @@ if (-not $ReuseFirmware) {
     $env:PLATFORMIO_BUILD_DIR = $firmwareBuild
     $pio = Get-Command pio -ErrorAction SilentlyContinue
     $command = if ($pio) { $pio.Source } else { Join-Path $platformHome 'penv/Scripts/platformio.exe' }
-    & $command run --project-dir $firmwareProject -e tallypager-pilot
+    & $command run --project-dir $firmwareProject -e tallypager-pilot -e tallypager-esp8266-base
     if ($LASTEXITCODE -ne 0) { throw 'Firmware-Build fehlgeschlagen.' }
 }
 
@@ -55,6 +55,15 @@ $manifest = Join-Path $firmwarePackage 'manifest.json'
 $files = @($images | ForEach-Object { Join-Path $firmwarePackage $_ }) + $manifest
 Compress-Archive -LiteralPath $files -DestinationPath $firmwareZip -Force
 
+$esp8266Image = Join-Path $firmwareBuild 'tallypager-esp8266-base/firmware.bin'
+$esp8266Zip = Join-Path $output "TallyPager-Firmware-ESP8266-$version.zip"
+[ordered]@{
+    board = 'esp8266'
+    version = $version
+    sha256 = [ordered]@{ 'firmware.bin' = (Get-FileHash -LiteralPath $esp8266Image).Hash.ToLowerInvariant() }
+} | ConvertTo-Json | Set-Content -LiteralPath $manifest -Encoding utf8NoBOM
+Compress-Archive -LiteralPath $esp8266Image,$manifest -DestinationPath $esp8266Zip -Force
+
 $publish = Join-Path $PSScriptRoot 'obj/portable'
 $publishArgs = @(
     (Join-Path $PSScriptRoot 'TallyPager.csproj'), '-c', 'Release', '-r', 'win-x64', '-o', $publish,
@@ -66,7 +75,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Windows-Build fehlgeschlagen.' }
 
 $exe = Join-Path $output 'TallyPager-Windows-x64.exe'
 Copy-Item -LiteralPath (Join-Path $publish 'TallyPager.exe') -Destination $exe
-$releaseFiles = @($exe, $firmwareZip)
+$releaseFiles = @($exe, $firmwareZip, $esp8266Zip)
 if ($Installer) {
     $compiler = (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source
     if (-not $compiler) {

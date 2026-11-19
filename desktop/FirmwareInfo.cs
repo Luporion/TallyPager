@@ -23,6 +23,7 @@ internal sealed class FirmwareInfo
         ["clock"] = "Uhrzeit",
         ["device-slots"] = "Geräteprofile am Stick",
         ["base-preview"] = "Mini-Anzeige auf der Funkbasis",
+        ["base-preview-details"] = "Mini-Vorschau mit Text und Verbindungsstatus",
         [RemoteSlots] = "Geräteprofil über Funk wechseln",
         ["presentation"] = "Tally-Großtext, Beamer und Live-Inputs"
     };
@@ -78,6 +79,7 @@ internal sealed class FirmwareInfo
         Older ? VersionText + " · älter" : Newer ? VersionText + " · neuer" : VersionText;
 
     public string[] Missing => features is null ? [] : Known.Where(pair => !Supports(pair.Key)).Select(pair => pair.Value).ToArray();
+    public string[] Available => features is null ? [] : Known.Where(pair => Supports(pair.Key)).Select(pair => pair.Value).ToArray();
     public string[] Unknown => features is null ? [] : features.Where(id => !Known.ContainsKey(id)).ToArray();
 
     public string Description

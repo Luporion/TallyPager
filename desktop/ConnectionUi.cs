@@ -19,6 +19,7 @@ internal sealed partial class MainWindow
     private readonly Button wifiApply = Action("Am Stick speichern");
     private RadioBridge? activeRadio;
     private Button? baseLink;
+    private Button? restorePager;
     private string? wifiDevice;
     private bool wifiEditing;
     private bool wifiSetupSelected;
@@ -52,7 +53,11 @@ internal sealed partial class MainWindow
         tabs.TabPages.Add(baseTab);
         var setupBase = Grid(baseTab, "USB-Funkbasis");
         Row(setupBase, "USB-Anschluss", basePort, Action("Ports suchen", (_, _) => ScanPorts()));
-        basePort.SelectedIndexChanged += (_, _) => baseFirmware.Text = "";
+        basePort.SelectedIndexChanged += (_, _) =>
+        {
+            baseFirmware.Text = "";
+            ShowBaseModes(null);
+        };
         Full(setupBase, Buttons(Action("Firmware lesen", async (_, _) => await InspectUsb(basePort, baseFirmware))));
         Full(setupBase, baseFirmware);
         Row(setupBase, "Funkmodus", baseTransport);
@@ -60,15 +65,54 @@ internal sealed partial class MainWindow
         baseTransport.SelectedIndexChanged += (_, _) => baseChannel.Enabled = IsEspNow(SelectedTransport(baseTransport));
         baseTransport.SelectedIndex = 0;
         baseLink = Action("Funkbasis verbinden", async (_, _) => await ConnectBase());
-        Full(setupBase, Buttons(Action("Stick als Funkbasis einrichten", async (_, _) => await ConfigureBase(false)),
-            baseLink, Action("Wieder als Pager starten", async (_, _) => await ConfigureBase(true))));
+        restorePager = Action("Wieder als Pager starten", async (_, _) => await ConfigureBase(true));
+        Full(setupBase, Buttons(Action("Funkbasis einrichten", async (_, _) => await ConfigureBase(false)),
+            baseLink, restorePager));
         Full(setupBase, baseStatus);
+        Heading(setupBase, "ESP8266-Funkbasis");
+        Full(setupBase, Buttons(Action("ESP8266-Firmware flashen", async (_, _) => await FlashEsp8266())));
         Full(setupBase, new Label
         {
             AutoSize = true, MaximumSize = new Size(700, 0),
-            Text = "Die Funkbasis bleibt per USB am Rechner. Verbinde einen weiteren Stick zum Einrichten mit USB und wähle dort denselben Funkmodus. ESP-NOW nutzt auf beiden Sticks denselben Kanal und die Adresse der Basis. BLE sucht die Pager automatisch."
+            Text = "ESP8266MOD mit 4 MB Flash · ESP-NOW per USB. Am Pager denselben Kanal und die Adresse der Funkbasis eintragen. " +
+                "Für BLE ist der Windows-Bluetooth-Adapter eine weitere Möglichkeit."
         });
         AddWindowsBluetoothControls(setupBase);
+    }
+
+    private async Task FlashEsp8266()
+    {
+        if (busy || changingModes) return;
+        if (basePort.SelectedItem is not string port || activeRadio?.Port == port)
+        {
+            baseStatus.Text = "Einen freien USB-Port für den ESP8266 auswählen.";
+            return;
+        }
+        string package = Path.Combine(AppContext.BaseDirectory, PagerUsb.Esp8266FirmwareFileName);
+        if (!File.Exists(package))
+        {
+            using var picker = new OpenFileDialog { Title = "ESP8266-Firmwarepaket auswählen", Filter = "Firmwarepaket (*.zip)|*.zip" };
+            if (picker.ShowDialog(this) != DialogResult.OK) return;
+            package = picker.FileName;
+        }
+        if (MessageBox.Show(this, $"Die Funkbasis-Firmware ersetzt das vorhandene Programm auf dem ESP8266 an {port}. Jetzt flashen?",
+                "ESP8266 flashen", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+        busy = true;
+        try
+        {
+            int channel = (int)baseChannel.Value;
+            baseStatus.Text = "ESP8266 und Flashgröße werden geprüft …";
+            await PagerUsb.Flash(port, package, new Progress<string>(value => baseStatus.Text = value), esp8266: true);
+            var status = await Task.Run(() => PagerUsb.ReadStatus(port, TimeSpan.FromSeconds(8)));
+            if (status.Board != "esp8266" || status.Version != PagerUsb.Version || !RadioBridge.CanConnect(status))
+                throw new InvalidOperationException("Die ESP8266-Funkbasis hat den Neustart nicht bestätigt.");
+            if (status.Channel != channel)
+                status = await Task.Run(() => PagerUsb.ConfigureBase(port, status.Id, "espnow", channel));
+            ShowUsbFirmware(status, baseFirmware);
+            baseStatus.Text = $"ESP8266 bereit · Adresse {Transport.DisplayAddress(status.RadioAddress)} · Kanal {status.Channel}. Jetzt Funkbasis verbinden.";
+        }
+        catch (Exception error) { baseStatus.Text = error.Message; }
+        finally { busy = false; }
     }
 
     private void AddWifiSetup(Control panel)
@@ -111,9 +155,30 @@ internal sealed partial class MainWindow
     private void ShowUsbFirmware(UsbStatus status, Label label)
     {
         core.ObserveUsbFirmware(status.Id, status.Firmware);
-        label.Text = status.Firmware?.Description ?? "Unbekannte Firmware.";
+        var info = status.Firmware;
+        label.Text = status.BoardName + " · " + (info?.Description ?? "Unbekannte Firmware.");
+        if (status.Board != "m5stick-cplus2" && info is { Available.Length: > 0 })
+            label.Text = $"{status.BoardName} · Firmware {info.ShortVersion}\nUnterstützt · {string.Join(", ", info.Available)}";
+        if (status.Board != "m5stick-cplus2" && info is { Unknown.Length: > 0 })
+            label.Text += "\nGemeldete Funktionen · " + string.Join(", ", info.Unknown);
+        if (label == baseFirmware) ShowBaseModes(status);
         if (status.Firmware is { Older: true })
             label.Text += "\nFirmware-Update kann separat gestartet werden.";
+    }
+
+    private void ShowBaseModes(UsbStatus? status)
+    {
+        string previous = SelectedTransport(baseTransport);
+        string[] modes = new[] { "espnow", "espnow-lr", "ble" }
+            .Where(mode => status is null || status.Firmware?.AllowsBase(mode) == true).ToArray();
+        baseTransport.Items.Clear();
+        baseTransport.Items.AddRange(modes.Select(mode => new ModeChoice(mode)).ToArray());
+        baseTransport.Enabled = modes.Length > 0;
+        if (modes.Length > 0)
+            baseTransport.SelectedIndex = Math.Max(0, Array.IndexOf(modes, previous));
+        if (restorePager is not null)
+            restorePager.Enabled = status is null || (status.Board == "m5stick-cplus2" &&
+                status.Firmware?.Supports(FirmwareInfo.RadioBase) == true);
     }
 
     private async Task<UsbStatus> ReadUsbFirmware(string port, Label label)
@@ -134,6 +199,12 @@ internal sealed partial class MainWindow
         if (picker.SelectedItem is not string port) { label.Text = "USB-Port auswählen."; return; }
         busy = true;
         try { await ReadUsbFirmware(port, label); }
+        catch (TimeoutException)
+        {
+            label.Text = "Chip und Flashgröße werden gelesen …";
+            try { label.Text = await PagerUsb.IdentifyHardware(port); }
+            catch (Exception error) { label.Text = error.Message; }
+        }
         catch (Exception error) { label.Text = error.Message; }
         finally { busy = false; }
     }
@@ -229,7 +300,8 @@ internal sealed partial class MainWindow
             string mode = SelectedTransport(baseTransport);
             int channel = (int)baseChannel.Value;
             var current = await ReadUsbFirmware(port, baseFirmware);
-            if (restore ? current.Firmware?.Supports(FirmwareInfo.RadioBase) != true : current.Firmware?.AllowsBase(mode) != true)
+            if (restore ? current.Board != "m5stick-cplus2" || current.Firmware?.Supports(FirmwareInfo.RadioBase) != true :
+                current.Firmware?.AllowsBase(mode) != true)
             {
                 baseStatus.Text = $"Firmware {current.Version} bietet diese Rollenänderung nicht an.";
                 return;

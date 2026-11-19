@@ -55,14 +55,40 @@ internal sealed class RadioBridge : IRadioBridge
     public void SendBaseView(PagerStatus[] pagers)
     {
         if (closed || failure is not null || Status.Firmware?.Supports("base-preview") != true) return;
-        var rows = pagers.Where(p => p.Transport == Mode).OrderByDescending(p => p.Online).Take(4).Select(pager => new
-        {
-            name = pager.Name[..Math.Min(20, pager.Name.Length)],
-            inside = pager.Online ? pager.View.Inside : 0,
-            outside = pager.Online ? pager.View.Outside : 0
-        });
-        outbound.Writer.TryWrite("TP BASEVIEW " + System.Text.Json.JsonSerializer.Serialize(rows));
+        outbound.Writer.TryWrite(BaseView(pagers, Mode, Status.Firmware.Supports("base-preview-details")));
     }
+
+    internal static string BaseView(PagerStatus[] pagers, string mode, bool details)
+    {
+        var selected = pagers.Where(p => p.Transport == mode).OrderByDescending(p => p.Online).Take(4);
+        var rows = selected.Select(pager =>
+        {
+            var view = pager.View;
+            int inside = pager.Online ? view.Inside : 0;
+            int outside = pager.Online ? view.Outside : 0;
+            string name = Compact(pager.Name, 17);
+            if (!details) return (object)new { name, inside, outside };
+            bool insideOn = view.InsideSource != "off", outsideOn = view.OutsideSource != "off";
+            int tally = view.TextMode == 1 ? (outsideOn ? outside : inside) : (insideOn ? inside : outside);
+            string text = view.TextMode == 0 ? Compact(view.Chat, 17) :
+                tally switch { 3 => "LIVE", 2 => "PREVIEW", 1 => "SAFE", _ => "?" };
+            string badge = !pager.Online ? "" : (view.Test, view.Beamer) switch
+            {
+                (true, true) => "TEST + BEAMER", (true, false) => "TEST", (false, true) => "BEAMER", _ => ""
+            };
+            return new { name, inside, outside, text, badge, online = pager.Online, insideOn, outsideOn };
+        });
+        return "TP BASEVIEW " + System.Text.Json.JsonSerializer.Serialize(rows, BaseViewJson);
+    }
+
+    private static readonly System.Text.Json.JsonSerializerOptions BaseViewJson = new()
+    {
+        Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+    };
+
+    private static string Compact(string text, int length) =>
+        string.Concat(text.Take(length).Select(ch => ch is >= ' ' and <= '~' or 'ä' or 'ö' or 'ü' or 'Ä' or 'Ö' or 'Ü' or 'ß'
+            ? ch : ' '));
 
     private async Task Pump()
     {

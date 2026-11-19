@@ -83,7 +83,7 @@ internal sealed partial class MainWindow : Form
     private readonly TabPage simulation = new("Simulation");
     private readonly TabPage setup = new("Stick einrichten/verwalten");
     private readonly Label selectedFirmware = Notice();
-    private readonly PagerPreview pagerPreview = new() { Visible = false };
+    private readonly PagerPreview pagerPreview = new();
     private readonly System.Windows.Forms.Timer timer = new() { Interval = 25 };
     private AtemSource? atem;
     private VmixSource? vmix;
@@ -102,7 +102,7 @@ internal sealed partial class MainWindow : Form
         Text = "TallyPager " + PagerUsb.Version;
         Font = new Font("Segoe UI", 10);
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(970, 740);
+        ClientSize = new Size(1210, 740);
         MinimumSize = new Size(710, 620);
         BackColor = Color.FromArgb(241, 245, 249);
         ForeColor = Color.FromArgb(22, 34, 49);
@@ -123,7 +123,16 @@ internal sealed partial class MainWindow : Form
         }, 0, 0);
         header.Controls.Add(Action("Updates", (_, _) => OpenUpdates()), 1, 0);
         layout.Controls.Add(header, 0, 0);
-        layout.Controls.Add(devices, 0, 1);
+        var deviceOverview = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = Padding.Empty
+        };
+        deviceOverview.ColumnStyles.Add(new(SizeType.Percent, 100));
+        deviceOverview.ColumnStyles.Add(new(SizeType.Absolute, 252));
+        deviceOverview.Controls.Add(devices, 0, 0);
+        pagerPreview.Margin = new Padding(8, 3, 0, 3);
+        deviceOverview.Controls.Add(pagerPreview, 1, 0);
+        layout.Controls.Add(deviceOverview, 0, 1);
         var deviceActions = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 2 };
         deviceActions.ColumnStyles.Add(new(SizeType.Percent, 100));
         deviceActions.ColumnStyles.Add(new(SizeType.AutoSize));
@@ -136,10 +145,16 @@ internal sealed partial class MainWindow : Form
         layout.Controls.Add(NetworkFooter(), 0, 4);
         Controls.Add(layout);
 
-        foreach (string column in new[] { "Stick", "Modus", "Innen", "Außen", "Verbindung", "WLAN", "RTT", "Akku", "Anzeige", "Chat", "Firmware", "Adresse" })
+        (string Title, int Width)[] deviceColumns =
+        [
+            ("Stick", 82), ("Modus", 94), ("Innen", 62), ("Außen", 62), ("Verbindung", 83), ("WLAN", 73),
+            ("RTT", 44), ("Akku", 42), ("Anzeige", 62), ("Chat", 55), ("Firmware", 70), ("Adresse", 122)
+        ];
+        foreach (var (title, width) in deviceColumns)
         {
-            int index = devices.Columns.Add(column, column);
+            int index = devices.Columns.Add(title, title);
             devices.Columns[index].SortMode = DataGridViewColumnSortMode.NotSortable;
+            devices.Columns[index].MinimumWidth = width;
         }
         devices.Columns[0].FillWeight = 145;
         devices.Columns[4].FillWeight = 115;
@@ -147,7 +162,6 @@ internal sealed partial class MainWindow : Form
         devices.Columns[7].FillWeight = 60;
         devices.Columns["Firmware"]!.FillWeight = 120;
         devices.Columns["Adresse"]!.FillWeight = 165;
-        devices.Columns["Adresse"]!.MinimumWidth = 122;
 
         tabs.TabPages.AddRange([overview, sources, simulation, setup]);
         AddOverview();
@@ -196,10 +210,6 @@ internal sealed partial class MainWindow : Form
         Full(grid, chatStatus);
         Full(grid, requireManualAck);
         AddManualTally(grid);
-        var showPreview = new CheckBox { Text = "Stick-Vorschau anzeigen", AutoSize = true };
-        showPreview.CheckedChanged += (_, _) => pagerPreview.Visible = showPreview.Checked;
-        Full(grid, showPreview);
-        Full(grid, pagerPreview);
         Row(grid, "Schnelltext", favorite, InlineButtons(Action("Übernehmen", (_, _) => LoadQuick()),
             Action("Direkt senden", (_, _) =>
             {
@@ -367,6 +377,11 @@ internal sealed partial class MainWindow : Form
         {
             usbStatus.Text = $"Prüfe {port} …";
             var current = await ReadUsbFirmware(port, usbFirmware);
+            if (current.Board != "m5stick-cplus2")
+            {
+                usbStatus.Text = "Dieses Gerät wird im Tab für die Funkbasis eingerichtet.";
+                return;
+            }
             if (current.Firmware?.AllowsUsbMode(mode) != true)
             {
                 usbStatus.Text = $"Firmware {current.Version} bietet die USB-Einrichtung für {Transport.Name(mode)} nicht an.";

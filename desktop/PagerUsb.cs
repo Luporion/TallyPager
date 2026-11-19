@@ -11,17 +11,24 @@ namespace TallyPager;
 internal sealed record UsbStatus(string Version, string Id, bool Configured, bool Wifi, string Ip,
     bool Core, int Inside, int Outside, string Cue, string Next, string Mode = "udp",
     bool BaseRole = false, string RadioAddress = "", int Channel = 6, bool RadioReady = false,
-    string[]? Features = null, int Slot = 0)
+    string[]? Features = null, int Slot = 0, string Board = "m5stick-cplus2")
 {
     public FirmwareInfo? Firmware => FirmwareInfo.Read(Version, Features);
+    public string BoardName => Board switch
+    {
+        "m5stick-cplus2" => "M5StickC Plus2",
+        "esp8266" => "ESP8266MOD · Funkbasis ohne Display",
+        _ => $"Anderes Gerät ({Board})"
+    };
 }
 internal sealed record UsbSettings(string Id, string Name, string Host, string Ssid, string Password,
     string Mode, string Gateway, int Channel, int Slot);
 
 internal static class PagerUsb
 {
-    public const string Version = "0.9.0";
+    public const string Version = "0.10.0";
     public const string FirmwareFileName = "TallyPager-Firmware-M5StickC-Plus2-" + Version + ".zip";
+    public const string Esp8266FirmwareFileName = "TallyPager-Firmware-ESP8266-" + Version + ".zip";
     private const string StatusPrefix = "TP ";
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
 
@@ -117,7 +124,7 @@ internal static class PagerUsb
     }
 
     public static UsbStatus RestorePager(string port, string id) =>
-        SetRole(port, id, status => status.BaseRole && status.Firmware?.Supports(FirmwareInfo.RadioBase) == true,
+        SetRole(port, id, status => status.Board == "m5stick-cplus2" && status.BaseRole && status.Firmware?.Supports(FirmwareInfo.RadioBase) == true,
             "TP PAGER", status => status.Configured && !status.BaseRole);
 
     private static UsbStatus SetRole(string port, string id, Func<UsbStatus, bool> supports, string command, Func<UsbStatus, bool> ready)
@@ -142,37 +149,65 @@ internal static class PagerUsb
          ("0xe000", "boot_app0.bin", 0x2000), ("0x10000", "firmware.bin", 0x330000)];
 
     private sealed record FirmwareManifest(string Board, string Version, Dictionary<string, string> Sha256);
+    private static readonly (string Offset, string Name, long Limit)[] Esp8266Images =
+        [("0x0", "firmware.bin", 0xff000)];
 
-    public static async Task Flash(string port, string package, IProgress<string> progress)
+    public static async Task Flash(string port, string package, IProgress<string> progress, bool esp8266 = false)
     {
-        string directory = Path.Combine(PilotCore.DataDirectory, "bundle", Version);
+        string directory = Path.Combine(PilotCore.DataDirectory, "bundle", Version, esp8266 ? "esp8266" : "m5stick-cplus2");
         Directory.CreateDirectory(directory);
         WriteVerifiedResource(directory, "esptool.exe");
-        LoadFirmware(package, directory);
-        var start = new ProcessStartInfo(Path.Combine(directory, "esptool.exe"))
-        {
-            WorkingDirectory = directory, CreateNoWindow = true, UseShellExecute = false,
-            RedirectStandardOutput = true, RedirectStandardError = true,
-        };
-        string[] common = ["--chip", "esp32", "--port", port];
+        LoadFirmware(package, directory, esp8266: esp8266);
+        var start = Flasher(directory);
+        string[] common = ["--chip", esp8266 ? "esp8266" : "esp32", "--port", port];
         bool correctChip = false;
-        await Run(start, [..common, "chip-id"], line =>
+        await Run(start, [..common, esp8266 ? "flash-id" : "chip-id"], line =>
         {
-            if (line.Contains("ESP32-PICO-V3-02", StringComparison.Ordinal)) correctChip = true;
+            if (line.Contains(esp8266 ? "Detected flash size: 4MB" : "ESP32-PICO-V3-02", StringComparison.Ordinal))
+                correctChip = true;
         });
         if (!correctChip)
-            throw new InvalidOperationException("Der ESP32-Chip passt nicht zum M5StickC Plus2.");
+            throw new InvalidOperationException(esp8266 ? "Am Port wird ein ESP8266 mit 4 MB Flash benötigt." :
+                "Der ESP32-Chip passt nicht zum M5StickC Plus2.");
         progress.Report("Firmware wird geschrieben und überprüft …");
-        await Run(start, [..common, "--baud", "460800", "write-flash", "--flash-mode", "dio",
-            "--flash-freq", "80m", "--flash-size", "8MB",
-            .. Images.SelectMany(image => new[] { image.Offset, image.Name })], line =>
+        var images = esp8266 ? Esp8266Images : Images;
+        await Run(start, [..common, "--baud", esp8266 ? "115200" : "460800", "write-flash", "--flash-mode", "dio",
+            "--flash-freq", esp8266 ? "40m" : "80m", "--flash-size", esp8266 ? "4MB" : "8MB",
+            .. images.SelectMany(image => new[] { image.Offset, image.Name })], line =>
             {
                 if (line.Contains('%') || line.Contains("verified", StringComparison.OrdinalIgnoreCase))
                     progress.Report(line.Trim());
             });
     }
 
-    internal static void LoadFirmware(string path, string? directory, string expectedVersion = Version)
+    public static async Task<string> IdentifyHardware(string port)
+    {
+        string directory = Path.Combine(PilotCore.DataDirectory, "bundle", Version, "probe");
+        Directory.CreateDirectory(directory);
+        WriteVerifiedResource(directory, "esptool.exe");
+        string chip = "";
+        string capacity = "";
+        await Run(Flasher(directory), ["--port", port, "flash-id"], line =>
+        {
+            if (line.StartsWith("Chip type:", StringComparison.Ordinal)) chip = line["Chip type:".Length..].Trim();
+            if (line.StartsWith("Detected flash size:", StringComparison.Ordinal))
+                capacity = line["Detected flash size:".Length..].Trim();
+        });
+        if (chip.StartsWith("ESP8266", StringComparison.Ordinal))
+            return capacity == "4MB" ? "ESP8266MOD · 4 MB Flash\nFirmware verfügbar für ESP-NOW als USB-Funkbasis."
+                : $"ESP8266 · {capacity} Flash\nDas ESP8266-Firmwarepaket benötigt 4 MB.";
+        if (chip.StartsWith("ESP32-PICO-V3-02", StringComparison.Ordinal))
+            return "ESP32-PICO-V3-02 · Chip des M5StickC Plus2\nDie TallyPager-Firmware meldet Modell und Funktionen nach dem Start.";
+        return $"Anderes Gerät · {(chip.Length == 0 ? "Chip unbekannt" : chip)}\nFirmwarepakete verfügbar für M5StickC Plus2 und ESP8266 mit 4 MB.";
+    }
+
+    private static ProcessStartInfo Flasher(string directory) => new(Path.Combine(directory, "esptool.exe"))
+    {
+        WorkingDirectory = directory, CreateNoWindow = true, UseShellExecute = false,
+        RedirectStandardOutput = true, RedirectStandardError = true
+    };
+
+    internal static void LoadFirmware(string path, string? directory, string expectedVersion = Version, bool esp8266 = false)
     {
         using var zip = ZipFile.OpenRead(path);
         var manifestEntry = zip.GetEntry("manifest.json");
@@ -180,16 +215,16 @@ internal static class PagerUsb
             throw new InvalidDataException("Im Firmwarepaket fehlt das Manifest.");
         using var manifestStream = manifestEntry.Open();
         var manifest = JsonSerializer.Deserialize<FirmwareManifest>(manifestStream, Json);
-        if (manifest is not { Board: "m5stick-cplus2", Sha256: not null } || manifest.Version != expectedVersion)
-            throw new InvalidDataException($"Bitte das M5StickC-Plus2-Firmwarepaket für TallyPager {expectedVersion} auswählen.");
+        if (manifest?.Sha256 is null || manifest.Board != (esp8266 ? "esp8266" : "m5stick-cplus2") || manifest.Version != expectedVersion)
+            throw new InvalidDataException($"Bitte das Firmwarepaket für {(esp8266 ? "ESP8266" : "M5StickC Plus2")} und TallyPager {expectedVersion} auswählen.");
 
-        foreach (var image in Images)
+        foreach (var image in esp8266 ? Esp8266Images : Images)
         {
             var entry = zip.GetEntry(image.Name);
             if (entry is null || entry.Length < 1 || entry.Length > image.Limit ||
                 !manifest.Sha256.TryGetValue(image.Name, out string? expected))
                 throw new InvalidDataException("Fehlendes oder ungültiges Firmware-Image: " + image.Name);
-            // Only read the four known files. ZIP paths never control the output location.
+            // Only read the known images. ZIP paths never control the output location.
             using var stream = entry.Open();
             byte[] bytes = new byte[checked((int)entry.Length)];
             stream.ReadExactly(bytes);

@@ -21,6 +21,7 @@ Name: "german"; MessagesFile: "compiler:Languages\German.isl"
 [Files]
 Source: "{#Artifacts}\TallyPager-Windows-x64.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Artifacts}\TallyPager-Firmware-M5StickC-Plus2-{#AppVersion}.zip"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#Artifacts}\TallyPager-Firmware-ESP8266-{#AppVersion}.zip"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Artifacts}\THIRD-PARTY-NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Artifacts}\esptool-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
 

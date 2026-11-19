@@ -72,6 +72,7 @@ try
     TestAcknowledgements(settings);
     TestFirmwareCompatibility(settings);
     TestRadioBridge(settings);
+    TestBasePreview(settings);
     await TestRemoteSlots(settings);
     TestRadioFragments();
     await TestWifiManagement(settings);
@@ -99,7 +100,18 @@ try
             File.Delete(Path.Combine(settings, image.Name));
         }
         Console.WriteLine("PASS separate firmware package and image checksums");
-        await TestGitHubUpdate(settings, Path.GetFullPath(args[0]));
+        await TestGitHubUpdate(settings, Path.GetFullPath(args[0]), args.Length > 1 ? Path.GetFullPath(args[1]) : null);
+        if (args.Length > 1)
+        {
+            PagerUsb.LoadFirmware(args[1], null, esp8266: true);
+            try
+            {
+                PagerUsb.LoadFirmware(args[1], null);
+                throw new InvalidOperationException("ESP8266 firmware must never be accepted as a M5Stick package");
+            }
+            catch (InvalidDataException) { }
+            Console.WriteLine("PASS ESP8266 firmware package, checksums and board validation");
+        }
     }
 }
 finally
@@ -193,9 +205,11 @@ static void TestAssignments(string settings)
 static void TestFirmwareCompatibility(string settings)
 {
     const string mac = "10061c286f4c";
+    var uiVersion = Version.Parse(PagerUsb.Version);
+    string newerVersion = new Version(uiVersion.Major, uiVersion.Minor, uiVersion.Build + 1).ToString();
     var legacyBase = PagerUsb.ParseStatus($$"""TP {"id":"{{id}}","version":"0.6.0","baseRole":true,"radioReady":true,"mode":"ble","radioAddress":"{{mac}}"}""");
     var early = PagerUsb.ParseStatus($$"""TP {"id":"{{id}}","version":"0.4.0","configured":true}""");
-    var future = PagerUsb.ParseStatus($$"""TP {"id":"{{id}}","version":"0.9.1","features":["usb-config","radio-base","ble","screen-colors-v2"],"configured":true,"baseRole":true,"radioReady":true,"mode":"ble","futureObject":{"other":2} }""");
+    var future = PagerUsb.ParseStatus($$"""TP {"id":"{{id}}","version":"{{newerVersion}}","features":["usb-config","radio-base","ble","screen-colors-v2"],"configured":true,"baseRole":true,"radioReady":true,"mode":"ble","futureObject":{"other":2} }""");
     Check(legacyBase?.Firmware is { Older: true, Advertised: false } && RadioBridge.CanConnect(legacyBase),
         "0.6.0 USB radio base must remain compatible without an update");
     Check(early?.Firmware is { Older: true } && early.Firmware.Missing.Contains("WLAN-Einstellungen") &&
@@ -228,13 +242,13 @@ static void TestFirmwareCompatibility(string settings)
     SendReport($"TP1|cfg_info|{id}|{session}|0.6.0|192.168.1.2|5061676572|||idle");
     Check(core.Statuses().Single() is { Firmware.VersionText: "0.6.0", Settings: not null, CanAck: true },
         "Unmodified 0.6.0 WLAN telemetry must provide a version and preserve WLAN management");
-    SendReport($"TP1|firmware|{id}|{new string('f', 32)}|0.9.1|screen-colors-v2");
+    SendReport($"TP1|firmware|{id}|{new string('f', 32)}|{newerVersion}|screen-colors-v2");
     Check(core.Statuses().Single().Firmware?.VersionText == "0.6.0", "Old session provided a firmware capability list");
-    SendReport($"TP1|firmware|{id}|{session}|0.9.1|usb-config,link-stats,screen-colors-v2");
-    SendReport($"TP1|cfg_info|{id}|{session}|0.9.1|192.168.1.2|5061676572|||idle");
+    SendReport($"TP1|firmware|{id}|{session}|{newerVersion}|usb-config,link-stats,screen-colors-v2");
+    SendReport($"TP1|cfg_info|{id}|{session}|{newerVersion}|192.168.1.2|5061676572|||idle");
     SendReport($"TP1|caps|{id}|{session}|ack");
     var report = core.Statuses().Single();
-    Check(report.Firmware is { VersionText: "0.9.1", Advertised: true } &&
+    Check(report.Firmware is { Advertised: true } && report.Firmware.VersionText == newerVersion &&
         report.Firmware.Unknown.SequenceEqual(new[] { "screen-colors-v2" }) && report.Settings is null && !report.CanAck,
         "Explicit firmware capabilities must win over older telemetry and control optional actions");
     core.SetPreview(id, new Preview(3, 1, "Text", "", ChatId: PilotCore.RandomHex(16), RequireAck: true));
@@ -325,7 +339,7 @@ static async Task TestDiagnosticStorage(string settings)
     Console.WriteLine("PASS bounded diagnostic history, periodic saving, restart, shutdown flush and corrupt-file recovery");
 }
 
-static async Task TestGitHubUpdate(string settings, string firmware)
+static async Task TestGitHubUpdate(string settings, string firmware, string? baseFirmware)
 {
     string exe = Path.Combine(Path.GetDirectoryName(firmware)!, GitHubUpdates.ExeName);
     if (!File.Exists(exe))
@@ -346,6 +360,9 @@ static async Task TestGitHubUpdate(string settings, string firmware)
     var release = new GitHubRelease($"v{version}", false, false,
         [asset, new(2, firmwareName, new FileInfo(firmware).Length, null, "uploaded"),
             new(3, firmwareName + ".sha256", sidecar.Length, null, "uploaded")]);
+    if (baseFirmware is not null)
+        release = release with { Assets = [.. release.Assets, new(4, PagerUsb.Esp8266FirmwareFileName,
+            new FileInfo(baseFirmware).Length, "sha256:" + Hash(baseFirmware), "uploaded")] };
     string root = Path.Combine(settings, "updates");
     var progress = new Progress<string>(_ => { });
     int executableDownloads = 0;
@@ -372,6 +389,8 @@ static async Task TestGitHubUpdate(string settings, string firmware)
             return new(HttpStatusCode.OK) { Content = new StreamContent(File.OpenRead(firmware)) };
         if (uri.Host == "github.com" && name == firmwareName + ".sha256")
             return new(HttpStatusCode.OK) { Content = new ByteArrayContent(sidecar) };
+        if (uri.Host == "github.com" && name == PagerUsb.Esp8266FirmwareFileName && baseFirmware is not null)
+            return new(HttpStatusCode.OK) { Content = new StreamContent(File.OpenRead(baseFirmware)) };
         throw new InvalidOperationException($"Unexpected connection to {uri.Host}");
     }));
     var updater = new GitHubUpdates(client);
@@ -383,6 +402,9 @@ static async Task TestGitHubUpdate(string settings, string firmware)
         Check(Hash(update.Executable) == exeHash && Hash(update.Firmware) == Hash(firmware) &&
             Path.GetDirectoryName(update.Executable) == Path.Combine(root, version.ToString()),
             "Matching executable and firmware must be installed together");
+        if (baseFirmware is not null)
+            Check(Hash(Path.Combine(Path.GetDirectoryName(update.Executable)!, PagerUsb.Esp8266FirmwareFileName)) == Hash(baseFirmware),
+                "The optional headless firmware must be installed beside the Windows executable");
         var repeat = await updater.Download(found, root, progress, CancellationToken.None);
         Check(repeat == update && executableDownloads == 1, "An already verified update must not be downloaded again");
         try
@@ -479,6 +501,32 @@ static void TestPresentationProtocol(string settings)
     core.Tick();
     Check(core.Statuses().Single(pager => pager.Id == id).PreviewReceived, "Display receipt must confirm the matching presentation");
     Console.WriteLine("PASS authenticated presentation feature negotiation and separate display confirmation");
+}
+
+static void TestBasePreview(string settings)
+{
+    var baseStatus = PagerUsb.ParseStatus($$"""TP {"version":"{{PagerUsb.Version}}","id":"10061c286f4c","board":"esp8266","baseRole":true,"mode":"espnow","radioAddress":"10061c286f4c","channel":6,"radioReady":true,"features":["radio-base","espnow"]}""");
+    Check(baseStatus is { Board: "esp8266", Firmware: { } firmware } && RadioBridge.CanConnect(baseStatus) &&
+        firmware.AllowsBase("espnow") && !firmware.AllowsBase("ble") && !firmware.AllowsBase("espnow-lr"),
+        "ESP8266 relay must advertise only supported radio capabilities");
+    using var core = new PilotCore(settings, 0);
+    var pager = core.Statuses().First() with
+    {
+        Transport = "espnow", Connection = Connection.Connected,
+        View = new(3, 0, new string('ü', 160), "", Test: true, OutsideSource: "off", TextMode: 1, Beamer: true)
+    };
+    var entries = Enumerable.Range(0, 5).Select(index => pager with { Name = $"{index} Müller" }).Append(
+        pager with { Name = "Other transport", Transport = "ble" }).ToArray();
+    string line = RadioBridge.BaseView(entries, "espnow", true);
+    Check(line.Length < 1024 && Encoding.UTF8.GetByteCount(line) < 1024, "Base preview must fit the UART command limit");
+    using var json = JsonDocument.Parse(line[12..]);
+    var first = json.RootElement[0];
+    Check(json.RootElement.GetArrayLength() == 4 && first.GetProperty("text").GetString() == "LIVE" &&
+        first.GetProperty("badge").GetString() == "TEST + BEAMER" && !first.GetProperty("outsideOn").GetBoolean(),
+        "Mini preview must show the matching radio, fallback layer, simulation and beamer");
+    using var legacy = JsonDocument.Parse(RadioBridge.BaseView(entries, "espnow", false)[12..]);
+    Check(!legacy.RootElement[0].TryGetProperty("text", out _), "Older base firmware must receive the original view");
+    Console.WriteLine("PASS headless board capabilities and detailed/legacy M5 base preview");
 }
 
 static void TestRadioBridge(string settings)

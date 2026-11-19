@@ -1,4 +1,5 @@
 #include "radio.h"
+#include "radio_frame.h"
 #include <BLE2902.h>
 #include <BLEDevice.h>
 #include <WiFi.h>
@@ -9,10 +10,9 @@
 
 namespace radio {
 namespace {
-constexpr size_t fragmentSize = 200;
-constexpr size_t headerSize = 8;
+using radio_frame::fragmentSize;
+using radio_frame::headerSize;
 constexpr size_t maxPeers = 6;
-constexpr uint32_t magic = 0x31525054;
 const char* serviceUuid = "d28b0400-d09a-4f12-bcdf-17a46b560e00";
 const char* downUuid = "d28b0401-d09a-4f12-bcdf-17a46b560e00";
 const char* upUuid = "d28b0402-d09a-4f12-bcdf-17a46b560e00";
@@ -27,14 +27,8 @@ struct Packet {
   uint16_t length;
   uint8_t bytes[packetLimit];
 };
-struct Assembly {
-  Packet packet;
-  uint16_t id = 0;
-  uint32_t updated = 0;
-  uint8_t received = 0;
-};
 QueueHandle_t incoming, outgoing, discoveries;
-Assembly assemblies[maxPeers];
+radio_frame::Assembly assemblies[maxPeers];
 uint8_t target[6]{};
 std::atomic<bool> started{false}, scanEnded{true};
 bool gateway, ble;
@@ -123,14 +117,7 @@ void connectCandidate(const Candidate& entry) {
 }
 
 size_t build(const Packet& packet, int part, uint8_t* output) {
-  size_t offset = part * fragmentSize;
-  memcpy(output, &magic, 4);
-  memcpy(output + 4, &packetId, 2);
-  output[6] = part;
-  output[7] = (packet.length + fragmentSize - 1) / fragmentSize;
-  size_t bytes = min(fragmentSize, packet.length - offset);
-  memcpy(output + headerSize, packet.bytes + offset, bytes);
-  return headerSize + bytes;
+  return radio_frame::encode(packet.bytes, packet.length, packetId, part, output);
 }
 
 void bleTask(void*) {
@@ -266,35 +253,10 @@ bool send(const uint8_t* address, const String& payload) {
 bool read(uint8_t* address, char (&payload)[packetLimit + 1]) {
   Frame frame{};
   for (int i = 0; i < 32 && incoming && xQueueReceive(incoming, &frame, 0); ++i) {
-    uint32_t marker;
-    uint16_t id;
-    memcpy(&marker, frame.bytes, 4);
-    memcpy(&id, frame.bytes + 4, 2);
-    uint8_t part = frame.bytes[6], count = frame.bytes[7];
-    size_t bytes = frame.length - headerSize, offset = part * fragmentSize;
-    if (marker != magic || count < 1 || count > (packetLimit + fragmentSize - 1) / fragmentSize ||
-        part >= count || offset + bytes > packetLimit || (part + 1 < count && bytes != fragmentSize)) continue;
-    uint32_t now = millis();
-    Assembly* active = nullptr;
-    for (auto& entry : assemblies) {
-      if (entry.received && now - entry.updated > 350) entry.received = 0;
-      if (memcmp(entry.packet.address, frame.address, 6) == 0 && entry.received) { active = &entry; break; }
-      if (!entry.received && !active) active = &entry;
-    }
-    if (!active || (part != 0 && (!active->received || id != active->id ||
-        memcmp(active->packet.address, frame.address, 6) != 0 || active->received != part))) continue;
-    if (part == 0) {
-      memcpy(active->packet.address, frame.address, 6);
-      active->id = id;
-    }
-    active->updated = now;
-    memcpy(active->packet.bytes + offset, frame.bytes + headerSize, bytes);
-    active->received = part + 1;
-    if (part + 1 != count) continue;
-    active->received = 0;
+    auto complete = radio_frame::receive(assemblies, frame.address, frame.bytes, frame.length, millis());
+    if (!complete) continue;
     memcpy(address, frame.address, 6);
-    memcpy(payload, active->packet.bytes, offset + bytes);
-    payload[offset + bytes] = 0;
+    strcpy(payload, complete);
     return true;
   }
   return false;

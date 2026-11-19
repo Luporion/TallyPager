@@ -19,7 +19,7 @@ constexpr size_t maxPacket = 900;
 constexpr char hexDigits[] = "0123456789abcdef";
 constexpr const char* firmwareFeatures[] = {"usb-config", "chat-ack", "link-stats", "diagnostics",
     "wifi-config", "wifi-discovery", "radio-base", "espnow", "espnow-lr", "ble",
-    "usb-read-settings", "clock", "device-slots", "base-preview", "remote-slots", "presentation"};
+    "usb-read-settings", "clock", "device-slots", "base-preview", "base-preview-details", "remote-slots", "presentation"};
 WiFiUDP udp, management;
 IPAddress core;
 String deviceId, name, ssid, password, nonce, session, cue, next, serialLine;
@@ -62,7 +62,11 @@ uint32_t trialDeadline = 0;
 uint32_t menuHeld = 0, menuTouched = 0, clockAt = 0, clockSeconds = 0;
 int lastMinute = -1;
 bool clockSynced = false, menuArmed = false, menuAttempted = false;
-struct BaseLine { String name; uint8_t inside = 0, outside = 0; };
+struct BaseLine {
+  String name, text, badge;
+  uint8_t inside = 0, outside = 0;
+  bool online = false, insideEnabled = true, outsideEnabled = true;
+};
 BaseLine baseLines[4];
 size_t baseCount = 0;
 uint32_t baseViewAt = 0;
@@ -738,6 +742,7 @@ bool baseConfig(JsonDocument& doc, bool save) {
 void status() {
   JsonDocument doc;
   doc["version"] = TALLY_PAGER_VERSION;
+  doc["board"] = "m5stick-cplus2";
   JsonArray features = doc["features"].to<JsonArray>();
   for (const char* feature : firmwareFeatures) features.add(feature);
   doc["id"] = deviceId;
@@ -811,6 +816,11 @@ void readBaseView(const char* payload) {
     line.name = String(row["name"] | "").substring(0, 24);
     line.inside = constrain(row["inside"] | 0, 0, 3);
     line.outside = constrain(row["outside"] | 0, 0, 3);
+    line.text = String(row["text"] | "").substring(0, 17);
+    line.badge = String(row["badge"] | "").substring(0, 16);
+    line.online = row["online"] | (line.inside != 0 || line.outside != 0);
+    line.insideEnabled = row["insideOn"] | true;
+    line.outsideEnabled = row["outsideOn"] | true;
   }
   baseViewAt = millis();
   dirty = true;
@@ -905,15 +915,21 @@ void draw() {
   } else if (baseRole) {
     display.fillScreen(TFT_BLACK);
     display.setTextColor(TFT_WHITE);
-    display.drawString("TallyPager Funkbasis", 5, 6);
-    display.drawString(mode + "  Kanal " + String(radioChannel), 5, 28);
+    display.drawString("Funkbasis   " + mode + (mode == "ble" ? "" : "  K:" + String(radioChannel)), 5, 6);
     if (baseCount && millis() - baseViewAt < 3500) {
       for (size_t i = 0; i < baseCount; ++i) {
-        int y = 48 + i * 20;
+        int x = 3 + (i % 2) * 119;
+        int y = 20 + (i / 2) * 56;
         auto& row = baseLines[i];
-        display.fillRect(6, y, 14, 14, colors[row.outside]);
-        display.fillRect(9, y + 3, 8, 8, colors[row.inside]);
-        display.drawString(displayText(row.name).substring(0, 31), 25, y + 3);
+        display.fillRect(x, y, 115, 52, row.outsideEnabled ? colors[row.outside] : TFT_BLACK);
+        display.fillRect(x + 3, y + 12, 109, 28, row.insideEnabled ? colors[row.inside] : TFT_BLACK);
+        display.drawString(displayText(row.name).substring(0, 17), x + 4, y + 2);
+        display.setTextColor(row.insideEnabled && row.inside >= 2 ? TFT_BLACK : TFT_WHITE);
+        display.drawString(row.online ? displayText(row.text) : "Getrennt", x + 5, y + 15);
+        display.drawString(row.badge, x + 5, y + 27);
+        display.setTextColor(TFT_WHITE);
+        display.drawString(String("I:") + (row.insideEnabled ? states[row.inside] : "-") +
+            " A:" + (row.outsideEnabled ? states[row.outside] : "-"), x + 4, y + 42);
       }
     } else {
       display.drawString("Adresse: " + radioMac, 5, 50);

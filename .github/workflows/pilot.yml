@@ -42,8 +42,10 @@ jobs:
       - name: Test protocol and firmware package
         shell: pwsh
         run: |
-          $firmware = Get-ChildItem dist -Recurse -Filter 'TallyPager-Firmware-*.zip' | Select-Object -First 1
-          dotnet run --project tests/ProtocolSmoke -- $firmware.FullName
+          $pager = Get-ChildItem dist -Recurse -Filter 'TallyPager-Firmware-M5StickC-Plus2-*.zip' | Select-Object -First 1
+          $base = Get-ChildItem dist -Recurse -Filter 'TallyPager-Firmware-ESP8266-*.zip' | Select-Object -First 1
+          if (!$pager -or !$base) { throw 'Both firmware packages are required.' }
+          dotnet run --project tests/ProtocolSmoke -- $pager.FullName $base.FullName
       - uses: actions/upload-artifact@v4
         with:
           name: TallyPager-Windows-x64
@@ -76,11 +78,12 @@ jobs:
           $version = $Matches[1]
           $exe = 'TallyPager-Windows-x64.exe'
           $zip = "TallyPager-Firmware-M5StickC-Plus2-$version.zip"
+          $esp8266 = "TallyPager-Firmware-ESP8266-$version.zip"
           $candidates = @(Get-ChildItem release -Recurse -Filter $exe)
           if ($candidates.Count -ne 1 -or $candidates[0].Directory.Name -ne $version) { throw 'Build and Git tag do not match.' }
           $folder = $candidates[0].Directory.FullName
           $setup = 'TallyPager-Setup-Windows-x64.exe'
-          $assets = @($exe, $zip, $setup, "$exe.sha256", "$zip.sha256", "$setup.sha256", 'THIRD-PARTY-NOTICES.txt', 'esptool-LICENSE.txt') |
+          $assets = @($exe, $zip, $esp8266, $setup, "$exe.sha256", "$zip.sha256", "$esp8266.sha256", "$setup.sha256", 'THIRD-PARTY-NOTICES.txt', 'esptool-LICENSE.txt') |
             ForEach-Object { (Get-Item -LiteralPath (Join-Path $folder $_)).FullName }
           gh release create $env:GITHUB_REF_NAME @assets --verify-tag --latest --title "TallyPager $version" --generate-notes
           if ($LASTEXITCODE -ne 0) { throw 'GitHub release publication failed.' }
