@@ -23,7 +23,8 @@ internal sealed class FirmwareInfo
         ["clock"] = "Uhrzeit",
         ["device-slots"] = "Geräteprofile am Stick",
         ["base-preview"] = "Mini-Anzeige auf der Funkbasis",
-        [RemoteSlots] = "Geräteprofil über Funk wechseln"
+        [RemoteSlots] = "Geräteprofil über Funk wechseln",
+        ["presentation"] = "Tally-Großtext, Beamer und Live-Inputs"
     };
     private static readonly string[] V04 = [Usb, "link-stats"];
     private static readonly string[] V05 = [.. V04, Acknowledge, "diagnostics"];

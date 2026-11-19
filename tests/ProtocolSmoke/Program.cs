@@ -77,6 +77,8 @@ try
     await TestWifiManagement(settings);
     await TestWifiDiscovery(settings);
     TestAssignments(settings);
+    TestManualPresentation(settings);
+    TestPresentationProtocol(settings);
     TestRegieCheck(settings);
     await TestDiagnosticStorage(settings);
     TestProfiles(settings);
@@ -410,6 +412,73 @@ static async Task TestGitHubUpdate(string settings, string firmware)
         Console.WriteLine("PASS GitHub updates, asset redirects, SHA-256, matched EXE/ZIP, no downgrades, caching and invalid downloads");
     }
     finally { if (Directory.Exists(root)) Directory.Delete(root, recursive: true); }
+}
+
+static void TestManualPresentation(string settings)
+{
+    string configurationPath = Path.Combine(settings, "devices.json");
+    string original = File.ReadAllText(configurationPath);
+    using var core = new PilotCore(settings, 0);
+    var first = core.Devices.Single(pager => pager.Id == id) with { Inside = new(MixerKind.Vmix, 2), Outside = new(MixerKind.Atem, 1) };
+    core.Save(first);
+    const string secondId = "123456789abd";
+    core.Save(new(secondId, "Zweiter Stick", PilotCore.RandomHex(32), new(MixerKind.Atem, 2), new(MixerKind.Vmix, 9)));
+    var session = new OperatorSession(core);
+    var atem = new MixerState("Verbunden", [new(1, "Cam 1", 1), new(2, "Cam 2", 3)]);
+    var vmix = new MixerState("Verbunden", [new(2, "Cam 2", 1), new(9, "Andere Kamera", 3)]);
+    session.SetControl(first.Id, new(ManualAtem: true, Atem: 3, Beamer: true, TextMode: 1, ShowLive: true));
+    session.Update(atem, vmix, 0);
+    var view = core.Statuses().Single(pager => pager.Id == first.Id).View;
+    Check(view is { Inside: 1, Outside: 3, Beamer: true, TextMode: 1 } &&
+        view.InsideLive.Contains("Andere Kamera") && view.OutsideLive == "ATEM: manuell",
+        "Manual source selection must respect swapped layers and retain external live names");
+    session.SetAllManual(true);
+    session.SetControl(first.Id, session.Control(first.Id) with { ManualVmix = false });
+    session.Update(MixerState.Off, MixerState.Off, 1);
+    Check(core.Statuses().Single(pager => pager.Id == first.Id).View is { Inside: 0, Outside: 3 } &&
+        session.Control(secondId) is { ManualAtem: true, ManualVmix: true },
+        "Global manual control and per-source exceptions must survive mixer failure");
+    session.Start([first.Id], new(Scenario.Manual, 1000, 2, 3, 0));
+    session.Update(atem, vmix, 2);
+    Check(core.Statuses().Single(pager => pager.Id == first.Id).View is { Inside: 3, Outside: 2, Test: true, Beamer: true },
+        "Simulation must override manual tally and retain presentation controls");
+    session.Stop([first.Id]);
+    session.SetControl(first.Id, new(ShowLive: true));
+    session.Update(atem, vmix, 3);
+    view = core.Statuses().Single(pager => pager.Id == first.Id).View;
+    Check(view.Inside == 1 && view.Outside == 1 && view.OutsideLive.Contains("Cam 2"),
+        "Returning to external sources must restore real source state and the other live input");
+    session.Reset();
+    Check(session.Control(first.Id) == new PagerControl(), "Profile reset must clear temporary manual states and beamer");
+    // Restore the fixture for subsequent one-device tests.
+    File.WriteAllText(configurationPath, original);
+    Console.WriteLine("PASS per-source manual override, global switch, layer swapping, beamer, live names and simulation priority");
+}
+
+static void TestPresentationProtocol(string settings)
+{
+    using var core = new PilotCore(settings, 0);
+    using var stick = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+    string key = core.Devices.Single(pager => pager.Id == id).Key;
+    string session = Connect(stick, core, key, new string('f', 32));
+    string firmware = $"TP1|firmware|{id}|{session}|{PagerUsb.Version}|presentation";
+    Send(stick, core, firmware, Tag(firmware, key));
+    core.Tick();
+    core.SetPreview(id, new(3, 1, "Chat", "", TextMode: 1, Beamer: true,
+        InsideLive: "ATEM: 4 Cam 4", OutsideLive: "vMix: 2 Kamera"));
+    string[] frame;
+    do { frame = Read(stick, core, key); } while (frame[1] != "presentation");
+    Check(frame[5] == "1" && frame[6] == "1" && Encoding.UTF8.GetString(Convert.FromHexString(frame[7])) == "ATEM: 4 Cam 4",
+        "Presentation must transport text selection, beamer and live source text on the signed session");
+    string receipt = $"TP1|seen|{id}|{session}|{frame[4]}|80";
+    Send(stick, core, receipt, Tag(receipt, key));
+    core.Tick();
+    Check(!core.Statuses().Single(pager => pager.Id == id).PreviewReceived, "State receipt alone cannot confirm the new display");
+    receipt = $"TP1|presented|{id}|{session}|{frame[4]}";
+    Send(stick, core, receipt, Tag(receipt, key));
+    core.Tick();
+    Check(core.Statuses().Single(pager => pager.Id == id).PreviewReceived, "Display receipt must confirm the matching presentation");
+    Console.WriteLine("PASS authenticated presentation feature negotiation and separate display confirmation");
 }
 
 static void TestRadioBridge(string settings)

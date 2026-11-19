@@ -30,7 +30,47 @@ internal sealed partial class MainWindow
         return actions;
     }
 
-    private void AddSetupLibrary(TableLayoutPanel grid)
+    private TableLayoutPanel SetupSection(TableLayoutPanel parent, string title)
+    {
+        var group = new GroupBox
+        {
+            Text = title, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Dock = DockStyle.Top, Padding = new Padding(12, 8, 12, 12),
+            Font = new Font(Font, FontStyle.Bold)
+        };
+        var grid = new TableLayoutPanel
+        {
+            AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Dock = DockStyle.Top,
+            ColumnCount = 3, Padding = new Padding(0, 4, 0, 0), Font = Font
+        };
+        grid.ColumnStyles.Add(new(SizeType.Absolute, 185));
+        grid.ColumnStyles.Add(new(SizeType.Percent, 100));
+        grid.ColumnStyles.Add(new(SizeType.AutoSize));
+        group.Controls.Add(grid);
+        Full(parent, group);
+        return grid;
+    }
+
+    private static void SetupHint(TableLayoutPanel grid, string text) => Full(grid, new Label
+    {
+        Text = text, AutoSize = true, MaximumSize = new Size(720, 0), Dock = DockStyle.Top,
+        ForeColor = Color.FromArgb(70, 83, 98)
+    });
+
+    private void ShowProfileHelp()
+    {
+        MessageBox.Show(this,
+            "Vorlagen werden auf diesem PC gespeichert. Sie füllen das Einrichtungsformular aus, damit du mehrere Sticks " +
+            "mit ähnlichen Einstellungen vorbereiten kannst. Mit „Stick einrichten“ überträgst du die Felder auf das Gerät.\n\n" +
+            "Geräteprofile liegen auf dem Stick. Die Speicherplätze 1 bis 4 enthalten jeweils einen kompletten Satz " +
+            "aus Funkmodus, WLAN und Serveradresse. „Stick einrichten“ speichert in den gewählten Platz und aktiviert ihn. " +
+            "Später wechselst du am Stick oder über „Funkmodus wechseln …“ zwischen den vorbereiteten Profilen.\n\n" +
+            "Regieprofile liegen auf dem PC. Sie speichern den Aufbau für eine Produktion, etwa Mixerquellen, " +
+            "Kamerarollen, Tally-Zuordnungen und Schnelltexte. Du verwaltest sie im Tab „Regieprofile“.",
+            "Vorlagen und Profile", MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+
+    private void AddSetupLibrary(TableLayoutPanel templatesGrid, TableLayoutPanel wirelessGrid)
     {
         var networks = Choices();
         var templates = Choices();
@@ -55,7 +95,7 @@ internal sealed partial class MainWindow
                 throw new InvalidDataException("Dieses Windows-Konto konnte die gespeicherten WLAN-Daten nicht lesen.", error);
             }
         }
-        Row(grid, "Gespeichertes WLAN", networks, InlineButtons(
+        Row(wirelessGrid, "Gespeichertes WLAN", networks, InlineButtons(
             Action("Laden", (_, _) => ProfileAction(() =>
             {
                 if (networks.SelectedItem is string network) ReadSavedNetwork(LoadSetupLibrary(), network);
@@ -71,15 +111,15 @@ internal sealed partial class MainWindow
                 networks.SelectedItem = ssid.Text;
                 usbStatus.Text = "WLAN im Windows-Benutzerkonto gespeichert.";
             }, usbStatus))));
-        Row(grid, "Einrichtungsvorlage", templates, InlineButtons(
-            Action("Laden", (_, _) => ProfileAction(() =>
+        Row(templatesGrid, "Vorlage", templates, InlineButtons(
+            Action("Vorlage laden", (_, _) => ProfileAction(() =>
             {
                 if (templates.SelectedItem is not string selected) return;
                 var library = LoadSetupLibrary();
                 var options = library.Templates[selected];
                 int index = Array.IndexOf(new[] { "udp", "espnow", "espnow-lr", "ble" }, options.Mode);
                 if (index < 0 || options.Channel is < 1 or > 13 || options.Slot is < 1 or > 4)
-                    throw new InvalidDataException("Die Einrichtungsvorlage enthält ungültige Funkdaten.");
+                    throw new InvalidDataException("Die Vorlage enthält ungültige Funkdaten.");
                 pagerTransport.SelectedIndex = index;
                 addresses.Text = options.Host;
                 ReadSavedNetwork(library, options.Ssid);
@@ -92,7 +132,7 @@ internal sealed partial class MainWindow
             Action("Als Vorlage speichern", (_, _) =>
             {
                 using var name = new TextBox { MaxLength = 48 };
-                if (!Edit("Einrichtungsvorlage speichern", ("Name", name)) || string.IsNullOrWhiteSpace(name.Text)) return;
+                if (!Edit("Vorlage speichern", ("Name", name)) || string.IsNullOrWhiteSpace(name.Text)) return;
                 ProfileAction(() =>
                 {
                     var library = LoadSetupLibrary();
@@ -101,7 +141,7 @@ internal sealed partial class MainWindow
                     ProfileStore.Write(SetupLibraryPath, library);
                     Refresh();
                     templates.SelectedItem = name.Text.Trim();
-                    usbStatus.Text = "Einrichtungsvorlage gespeichert.";
+                    usbStatus.Text = "Vorlage gespeichert.";
                 }, usbStatus);
             })));
         ProfileAction(Refresh, usbStatus);
@@ -126,22 +166,36 @@ internal sealed partial class MainWindow
             return;
         }
         busy = true;
+        setup.Controls[0].Enabled = false;
         try
         {
             var data = await Task.Run(() => PagerUsb.ReadSettings(port));
-            using var dialog = new Form { Text = "Stick-Einstellungen", StartPosition = FormStartPosition.CenterParent,
-                Font = Font, ClientSize = new Size(640, 345), MinimizeBox = false, MaximizeBox = false };
-            var grid = Grid(dialog, data.Name);
-            Full(grid, new Label { Text = $"{Transport.Name(data.Mode)} · Geräteprofil {data.Slot + 1}", AutoSize = true });
-            Row(grid, "Adresse des Core-PCs", new TextBox { Text = data.Host, ReadOnly = true });
-            Row(grid, "WLAN-Name", new TextBox { Text = data.Ssid, ReadOnly = true });
-            var secret = new TextBox { Text = data.Password, ReadOnly = true, UseSystemPasswordChar = true };
-            Row(grid, "WLAN-Passwort", secret, Reveal(secret));
-            Full(grid, Action("Schließen", (_, _) => dialog.Close()));
-            dialog.ShowDialog(this);
-            secret.Clear();
+            LoadDeviceSettings(data);
+            usbStatus.Text = $"Einstellungen von {data.Name} geladen · Geräteprofil {data.Slot + 1}.";
         }
         catch (Exception error) { usbStatus.Text = error.Message; }
-        finally { busy = false; }
+        finally
+        {
+            busy = false;
+            setup.Controls[0].Enabled = true;
+        }
+    }
+
+    private void LoadDeviceSettings(UsbSettings data)
+    {
+        var mode = pagerTransport.Items.OfType<ModeChoice>().FirstOrDefault(item => item.Id == data.Mode);
+        if (mode is null || data.Channel < pagerChannel.Minimum || data.Channel > pagerChannel.Maximum ||
+            data.Slot + 1 < deviceSlot.Minimum || data.Slot + 1 > deviceSlot.Maximum)
+            throw new InvalidDataException("Die ausgelesenen Funk- oder Profildaten werden von dieser App nicht unterstützt.");
+
+        // Changing the mode can prefill a connected base. Apply the device's own values afterwards.
+        pagerTransport.SelectedItem = mode;
+        addresses.Text = data.Host;
+        pagerName.Text = data.Name;
+        ssid.Text = data.Ssid;
+        password.Text = data.Password;
+        gatewayAddress.Text = data.Gateway;
+        pagerChannel.Value = data.Channel;
+        deviceSlot.Value = data.Slot + 1;
     }
 }

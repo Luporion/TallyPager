@@ -12,7 +12,8 @@ internal sealed record Assignment(MixerKind Mixer, int Input, string? Key = null
 internal sealed record Pager(string Id, string Name, string Key, Assignment? Inside = null, Assignment? Outside = null,
     string? ConfiguredTransport = null);
 internal sealed record Preview(int Inside, int Outside, string Chat, string Next, bool Test = false,
-    string InsideSource = "Innen", string OutsideSource = "Aussen", string ChatId = "", bool RequireAck = false)
+    string InsideSource = "Innen", string OutsideSource = "Aussen", string ChatId = "", bool RequireAck = false,
+    int TextMode = 0, bool Beamer = false, string InsideLive = "", string OutsideLive = "")
 {
     public static Preview Clear { get; } = new(0, 0, "", "");
 }
@@ -105,6 +106,7 @@ internal sealed class PilotCore : IDisposable
         public uint SeenSequence { get; set; }
         public uint TelemetrySequence { get; set; }
         public uint PreviewSequence { get; set; }
+        public uint PresentationSeen { get; set; }
         public long SeenAt { get; set; } = -6000;
         public long HandshakeAt { get; set; } = -6000;
         public long ClockAt { get; set; } = -60000;
@@ -219,7 +221,8 @@ internal sealed class PilotCore : IDisposable
             var address = online ? link.LastAddress : managed?.Endpoint.Address.ToString();
             bool canSwitch = online && link.Firmware?.Supports(FirmwareInfo.RemoteSlots) == true;
             return new PagerStatus(link.Pager.Id, link.Pager.Name, state, link.Battery,
-                online && link.PreviewSequence > 0 && link.SeenSequence >= link.PreviewSequence,
+                online && link.PreviewSequence > 0 && link.SeenSequence >= link.PreviewSequence &&
+                    (link.Firmware?.Supports("presentation") != true || link.PresentationSeen >= link.PreviewSequence),
                 online ? link.Rssi : null, online ? link.Rtt : null, link.Preview, CanAcknowledge(link),
                 link.SentAt, link.ReceivedAt, link.AcknowledgedAt, link.SeenAt >= 0 ? age : null,
                 link.Transport, wifi, firmware ?? link.LastFirmware ??
@@ -476,6 +479,7 @@ internal sealed class PilotCore : IDisposable
             link.Active = pending;
             link.Pending = null;
             link.Sequence = link.SeenSequence = link.PreviewSequence = link.TelemetrySequence = 0;
+            link.PresentationSeen = 0;
             link.Battery = link.Rssi = link.Rtt = link.StateAge = null;
             link.CanAck = false;
             link.Firmware = null;
@@ -494,6 +498,9 @@ internal sealed class PilotCore : IDisposable
         {
             if (fields is [_, "caps", _, _, "ack"])
                 link.CanAck = true;
+            else if (fields is [_, "presented", _, _, var presentation] &&
+                uint.TryParse(presentation, out uint shown) && shown > link.PresentationSeen && shown <= link.Sequence)
+                link.PresentationSeen = shown;
             else if (fields[1] == "firmware")
                 ObserveFirmware(link, ParseFirmware(fields));
             else if (fields is [_, "slots", _, _, var slot, var entries] && InRange(slot, 0, 3) is int current)
@@ -602,6 +609,9 @@ internal sealed class PilotCore : IDisposable
             body += $"|{preview.ChatId}|{(requestAck ? 1 : 0)}";
         }
         if (!Send(link, active.Endpoint, body)) return 0;
+        if (link.Firmware?.Supports("presentation") == true)
+            Send(link, active.Endpoint, FormattableString.Invariant(
+                $"TP1|presentation|{link.Pager.Id}|{active.Session}|{link.Sequence}|{preview.TextMode}|{(preview.Beamer ? 1 : 0)}|{TextHex(preview.InsideLive)}|{TextHex(preview.OutsideLive)}"));
         if (preview.ChatId.Length > 0) link.SentAt ??= DateTimeOffset.UtcNow;
         return link.Sequence;
     }

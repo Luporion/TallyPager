@@ -124,9 +124,14 @@ internal sealed partial class MainWindow : Form
         header.Controls.Add(Action("Updates", (_, _) => OpenUpdates()), 1, 0);
         layout.Controls.Add(header, 0, 0);
         layout.Controls.Add(devices, 0, 1);
+        var deviceActions = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 2 };
+        deviceActions.ColumnStyles.Add(new(SizeType.Percent, 100));
+        deviceActions.ColumnStyles.Add(new(SizeType.AutoSize));
         selectedFirmware.MaximumSize = new Size(800, 0);
         selectedFirmware.Margin = new Padding(3, 3, 3, 7);
-        layout.Controls.Add(selectedFirmware, 0, 2);
+        deviceActions.Controls.Add(selectedFirmware, 0, 0);
+        deviceActions.Controls.Add(Action("Funkmodus wechseln …", (_, _) => OpenRemoteModes()), 1, 0);
+        layout.Controls.Add(deviceActions, 0, 2);
         layout.Controls.Add(tabs, 0, 3);
         layout.Controls.Add(NetworkFooter(), 0, 4);
         Controls.Add(layout);
@@ -173,6 +178,7 @@ internal sealed partial class MainWindow : Form
             vmix?.Dispose();
             arbiter?.Dispose();
             companion?.Dispose();
+            remoteModesDialog?.Dispose();
         };
     }
 
@@ -189,6 +195,7 @@ internal sealed partial class MainWindow : Form
             Action("Chat und Next leeren", (_, _) => SendText(true, true, clear: true))));
         Full(grid, chatStatus);
         Full(grid, requireManualAck);
+        AddManualTally(grid);
         var showPreview = new CheckBox { Text = "Stick-Vorschau anzeigen", AutoSize = true };
         showPreview.CheckedChanged += (_, _) => pagerPreview.Visible = showPreview.Checked;
         Full(grid, showPreview);
@@ -263,52 +270,59 @@ internal sealed partial class MainWindow : Form
         var method = Choices();
         method.AccessibleName = "Verbindungsart";
         method.Width = 175;
-        method.Items.AddRange(["USB", "WLAN", "Funkmodus wechseln"]);
+        method.Items.AddRange(["USB", "WLAN"]);
         header.Controls.Add(new Label { Text = "Verbindungsart", AutoSize = true, Margin = new Padding(0, 7, 12, 0) });
         header.Controls.Add(method);
         page.Controls.Add(header, 0, 0);
         var content = new Panel { Dock = DockStyle.Fill };
         var usb = new Panel { Dock = DockStyle.Fill };
         var wireless = new Panel { Dock = DockStyle.Fill };
-        var remote = new Panel { Dock = DockStyle.Fill };
-        content.Controls.AddRange([remote, wireless, usb]);
+        content.Controls.AddRange([wireless, usb]);
         page.Controls.Add(content, 0, 1);
         method.SelectedIndexChanged += (_, _) =>
         {
             wifiSetupSelected = method.SelectedIndex == 1;
             usb.Visible = method.SelectedIndex == 0;
             wireless.Visible = wifiSetupSelected;
-            remote.Visible = method.SelectedIndex == 2;
             RefreshConnectionTools();
         };
 
-        var grid = Grid(usb, "USB-Einrichtung");
+        var grid = Grid(usb, "USB-Verbindung");
+        grid.MaximumSize = new Size(1160, 0);
         Row(grid, "USB-Anschluss", ports, Action("Ports suchen", (_, _) => ScanPorts()));
         Full(grid, usbPortStatus);
         ports.SelectedIndexChanged += (_, _) => usbFirmware.Text = "";
         Full(grid, Buttons(Action("Firmware lesen", async (_, _) => await InspectUsb(ports, usbFirmware)),
             Action("Stick auslesen", async (_, _) => await InspectDeviceSettings())));
-        Full(grid, usbFirmware);
-        Row(grid, "Firmwarepaket", firmware, Action("ZIP auswählen", (_, _) => SelectFirmware()));
-        Row(grid, "Funkmodus", pagerTransport);
-        Row(grid, "Adresse des Basis-Servers", addresses);
-        Row(grid, "Name des Sticks", pagerName);
-        Row(grid, "WLAN-Name", ssid);
-        Row(grid, "WLAN-Passwort", password, Reveal(password));
-        Row(grid, "Adresse der Funkbasis", gatewayAddress);
-        Row(grid, "ESP-NOW-Kanal", pagerChannel);
-        Row(grid, "Geräteprofil am Stick", deviceSlot);
-        AddSetupLibrary(grid);
-        Full(grid, keepWifi);
-        Full(grid, incrementName);
-        Full(grid, Buttons(Action("Stick einrichten", async (_, _) => await Provision()),
-            Action("Firmware aktualisieren", async (_, _) => await UpdateUsbFirmware())));
+        var templates = SetupSection(grid, "Vorlagen");
+        SetupHint(templates, "Auf diesem PC gespeicherte Einstellungen laden und für weitere Sticks wiederverwenden.");
+        var device = SetupSection(grid, "Stick");
+        Row(device, "Name des Sticks", pagerName);
+        Row(device, "Geräteprofil am Stick", deviceSlot,
+            Action("Profile erklärt", (_, _) => ShowProfileHelp()));
+        SetupHint(device, "Speicherplatz 1–4 auf dem Stick. „Stick einrichten“ speichert die Einstellungen in diesem Platz und aktiviert ihn.");
+        var wirelessSettings = SetupSection(grid, "Wireless");
+        Row(wirelessSettings, "Funkmodus", pagerTransport);
+        Row(wirelessSettings, "Adresse des Basis-Servers", addresses);
+        Row(wirelessSettings, "WLAN-Name", ssid);
+        Row(wirelessSettings, "WLAN-Passwort", password, Reveal(password));
+        AddSetupLibrary(templates, wirelessSettings);
+        Row(wirelessSettings, "Adresse der Funkbasis", gatewayAddress);
+        Row(wirelessSettings, "ESP-NOW-Kanal", pagerChannel);
+        SetupHint(wirelessSettings, "WLAN + UDP verwendet WLAN und Basis-Server. ESP-NOW verwendet Funkbasis-Adresse und Kanal. BLE sucht die Funkverbindung automatisch.");
+        var fleet = SetupSection(grid, "Mehrere Sticks einrichten");
+        Full(fleet, keepWifi);
+        Full(fleet, incrementName);
+        Full(grid, Buttons(Action("Stick einrichten", async (_, _) => await Provision())));
         Full(grid, usbStatus);
+        var firmwareSettings = SetupSection(grid, "Firmware");
+        Full(firmwareSettings, usbFirmware);
+        Row(firmwareSettings, "Firmwarepaket", firmware, Action("ZIP auswählen", (_, _) => SelectFirmware()));
+        Full(firmwareSettings, Buttons(Action("Firmware aktualisieren", async (_, _) => await UpdateUsbFirmware())));
         usbStatus.Text = "Bei leeren WLAN-Feldern verwendet der Stick die gespeicherte Verbindung.";
         pagerTransport.SelectedIndexChanged += (_, _) => UpdateProvisionFields();
         pagerTransport.SelectedIndex = 0;
         AddWifiSetup(wireless);
-        AddRemoteModes(remote);
         method.SelectedIndex = 0;
     }
 
@@ -663,6 +677,7 @@ internal sealed partial class MainWindow : Form
             RefreshRows();
             RefreshDiagnostics(v);
             RefreshConnectionTools();
+            if (tabs.SelectedTab == overview) RefreshManualTally();
         }
         catch (SocketException) { chatStatus.Text = "Netzwerkfehler. Bitte LAN und UDP-Port 46224 prüfen."; }
     }

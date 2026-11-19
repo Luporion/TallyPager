@@ -6,21 +6,32 @@ internal sealed partial class MainWindow
     private readonly Button remoteSwitch = Action("Ausgewählten Stick umstellen"),
         fleetSwitch = Action("Alle erreichbaren Sticks umstellen");
     private readonly Label remoteTarget = Notice(), remoteResult = Notice();
+    private Form? remoteModesDialog;
     private bool changingModes;
 
     private WindowsBleBridge? windowsBluetooth;
     private Button? windowsBluetoothLink;
     private readonly Label windowsBluetoothStatus = Notice();
 
-    private void AddRemoteModes(Control page)
+    private void OpenRemoteModes()
     {
-        var grid = Grid(page, "Funkmodus wechseln");
-        Full(grid, new Label
+        if (remoteModesDialog is null)
         {
-            AutoSize = true, MaximumSize = new Size(700, 0),
-            Text = "Die App schaltet über die laufende Tally-Verbindung auf ein Geräteprofil um, das bereits auf dem Stick liegt. " +
-                "Wenn die neue Verbindung ausbleibt, kehrt der Stick zum vorherigen Profil zurück."
-        });
+            remoteModesDialog = new Form
+            {
+                Text = "Funkmodus wechseln", ClientSize = new Size(680, 460),
+                MinimumSize = new Size(550, 340), StartPosition = FormStartPosition.CenterParent,
+                ShowInTaskbar = false, MinimizeBox = false, MaximizeBox = false, Font = Font
+            };
+            AddRemoteModes(remoteModesDialog);
+        }
+        RefreshRemoteModes();
+        remoteModesDialog.ShowDialog(this);
+    }
+
+    private void AddRemoteModes(Form dialog)
+    {
+        var grid = Grid(dialog, "Ausgewählter Stick");
         Full(grid, remoteTarget);
         Row(grid, "Geräteprofil", remoteProfile, remoteSwitch);
         remoteSwitch.Click += async (_, _) =>
@@ -35,11 +46,16 @@ internal sealed partial class MainWindow
         fleetSwitch.Click += async (_, _) => await SwitchFleet();
         Full(grid, new Label
         {
-            AutoSize = true, MaximumSize = new Size(700, 0),
-            Text = "Die Flotte verwendet pro Stick das gespeicherte Profil für den Zielmodus. Die Funkbasis für diesen Modus muss bereit sein. " +
-                "Sticks mit mehreren passenden Profilen lassen sich oben einzeln umstellen."
+            AutoSize = true, MaximumSize = new Size(480, 0),
+            Text = "Jeder Stick braucht ein eindeutiges Profil für den Zielmodus. Wenn die neue Verbindung ausbleibt, " +
+                "kehrt der Stick zum bisherigen Profil zurück."
         });
+        remoteTarget.MaximumSize = remoteResult.MaximumSize = new Size(480, 0);
         Full(grid, remoteResult);
+        var close = Action("Schließen");
+        close.DialogResult = DialogResult.Cancel;
+        Full(grid, Buttons(close));
+        dialog.CancelButton = close;
     }
 
     private void RefreshRemoteModes()
@@ -57,7 +73,7 @@ internal sealed partial class MainWindow
         }
         remoteTarget.Text = pager switch
         {
-            null => "Oben einen einzelnen Stick auswählen.",
+            null => "Für den Einzelwechsel zuerst genau einen Stick in der Tabelle auswählen.",
             { Online: false } => $"{pager.Name} · Tally-Verbindung erforderlich.",
             { Firmware: { } fw } when !fw.Supports(FirmwareInfo.RemoteSlots) =>
                 $"{pager.Name} · Funkwechsel benötigt die Firmware ab 0.8.0.",
@@ -72,7 +88,8 @@ internal sealed partial class MainWindow
     {
         bool ready = !changingModes && !busy;
         remoteSwitch.Enabled = ready && remoteProfile.SelectedItem is DeviceSlot;
-        fleetSwitch.Enabled = fleetMode.Enabled = remoteProfile.Enabled = ready;
+        remoteProfile.Enabled = ready && remoteProfile.Items.Count > 0;
+        fleetSwitch.Enabled = fleetMode.Enabled = ready;
     }
 
     private string? CheckTarget(DeviceSlot slot)
@@ -121,7 +138,7 @@ internal sealed partial class MainWindow
         }
         string targets = string.Join("\n", eligible.Select(item => $"{item.Pager.Name} → {item.Slot}"));
         string prompt = "Während des Neustarts setzt die Tally-Anzeige kurz aus. Funkmodus jetzt wechseln?\n\n" + targets;
-        if (MessageBox.Show(this, prompt, "Funkmodus wechseln", MessageBoxButtons.YesNo, MessageBoxIcon.Question,
+        if (MessageBox.Show(remoteModesDialog ?? this, prompt, "Funkmodus wechseln", MessageBoxButtons.YesNo, MessageBoxIcon.Question,
                 MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
         changingModes = true;
         RefreshModeButtons();

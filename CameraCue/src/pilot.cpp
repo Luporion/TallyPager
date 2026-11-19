@@ -19,7 +19,7 @@ constexpr size_t maxPacket = 900;
 constexpr char hexDigits[] = "0123456789abcdef";
 constexpr const char* firmwareFeatures[] = {"usb-config", "chat-ack", "link-stats", "diagnostics",
     "wifi-config", "wifi-discovery", "radio-base", "espnow", "espnow-lr", "ble",
-    "usb-read-settings", "clock", "device-slots", "base-preview", "remote-slots"};
+    "usb-read-settings", "clock", "device-slots", "base-preview", "remote-slots", "presentation"};
 WiFiUDP udp, management;
 IPAddress core;
 String deviceId, name, ssid, password, nonce, session, cue, next, serialLine;
@@ -52,6 +52,10 @@ uint32_t connectedAt = 0;
 int rtt = -1;
 bool configured = false, udpReady = false, diagnostics = false, dirty = true, serialOverflow = false;
 bool testMode = false;
+int textMode = 0;
+bool beamerLive = false;
+String insideLive, outsideLive;
+uint32_t presentationSequence = 0, presentationAt = 0;
 int activeSlot = 0, chosenSlot = -1;
 String slotRequest, slotOutcome, trialConfig;
 uint32_t trialDeadline = 0;
@@ -148,6 +152,11 @@ void newSession() {
   rtt = -1;
   inside = outside = 0;
   testMode = false;
+  textMode = 0;
+  beamerLive = false;
+  insideLive = outsideLive = "";
+  presentationSequence = 0;
+  presentationAt = 0;
   cue = next = "";
   chatId = shownId = "";
   requireAck = false;
@@ -215,6 +224,26 @@ void receive(uint32_t now) {
       dirty = true;
     }
     if (session.isEmpty() || count < 5 || fields[3] != session) continue;
+    if (count == 9 && fields[1] == "presentation") {
+      char* end = nullptr;
+      unsigned long number = strtoul(fields[4].c_str(), &end, 10);
+      String first, second;
+      if (end == fields[4].c_str() || *end || !sequence || number != sequence || number < presentationSequence ||
+          (fields[5] != "0" && fields[5] != "1" && fields[5] != "2") ||
+          (fields[6] != "0" && fields[6] != "1") ||
+          !decodeText(fields[7], first, 144) || !decodeText(fields[8], second, 144)) continue;
+      int selected = fields[5].toInt();
+      bool beamer = fields[6] == "1";
+      dirty |= textMode != selected || beamerLive != beamer || insideLive != first || outsideLive != second;
+      textMode = selected;
+      beamerLive = beamer;
+      insideLive = first;
+      outsideLive = second;
+      presentationSequence = number;
+      presentationAt = now;
+      send("TP1|presented|" + deviceId + "|" + session + "|" + String(number));
+      continue;
+    }
     if (count == 6 && fields[1] == "switch_slot" && sequence) {
       handleSlot(fields[4], fields[5], now);
       continue;
@@ -339,7 +368,7 @@ void network(uint32_t now) {
            "|" + String(wifiDowntime.load()) + "|" + String(missedStates) + "|" + String(snapshotDowntime));
       lastDiagnostic = now;
     }
-    if (!chatId.isEmpty() && shownId == chatId) {
+    if (textMode == 0 && !chatId.isEmpty() && shownId == chatId) {
       const char* receipt = pendingAck == chatId ? "ack" : "shown";
       send("TP1|chat_rcpt|" + deviceId + "|" + session + "|" + chatId + "|" + receipt);
     }
@@ -907,7 +936,6 @@ void draw() {
     display.fillRect(6, 18, 228, 100, showInside ? colors[inside] : TFT_BLACK);
     display.setTextColor(TFT_WHITE);
     String headline = next.isEmpty() ? name : "next: " + displayText(next);
-    if (testMode) headline = "TEST " + headline;
     display.drawString(headline.substring(0, 19), 5, 5);
     const int bars = qualityBars();
     const bool delayed = linkDelayed();
@@ -924,13 +952,27 @@ void draw() {
     }
     display.drawString(connection, mode == "udp" ? 148 : 128, 5);
     display.setTextColor(TFT_WHITE);
-    if (showOutside) display.drawString(outsideSource + ": " + states[outside], 6, 123);
+    if (beamerLive && sequence) {
+      display.fillRect(143, 18, 97, 11, TFT_BLACK);
+      display.drawString("LIVE auf BEAMER", 147, 20);
+    }
+    if (testMode && sequence) {
+      display.fillRect(6, 30, 228, 12, TFT_BLACK);
+      display.drawString("Simulationssignal vom Rechner", 12, 32);
+    }
+    if (showOutside) display.drawString(outsideSource + ": " + states[outside], 12, 93);
     if (lastMinute >= 0) {
       char timeText[6];
       snprintf(timeText, sizeof(timeText), "%02d:%02d", lastMinute / 60, lastMinute % 60);
       display.drawString(timeText, 201, 123);
     }
-    if (showInside) display.drawString(insideSource + ": " + states[inside], 12, 102);
+    if (showInside) display.drawString(insideSource + ": " + states[inside], 12, 83);
+    if (sequence) {
+      display.setTextDatum(top_center);
+      display.drawString(displayText(insideLive).substring(0, 36), 120, 105);
+      display.drawString(displayText(outsideLive).substring(0, 36), 120, 115);
+      display.setTextDatum(top_left);
+    }
     if (!configured || sequence == 0) {
       const char* message = !configured ? "USB-Setup starten" :
           mode != "udp" ? (radio::ready() ? "Suche Funkbasis" : "Funkstart fehlgeschlagen") :
@@ -938,19 +980,35 @@ void draw() {
       display.drawString(message, 12, 38);
     } else {
       display.setTextColor(showInside && inside >= 2 ? TFT_BLACK : TFT_WHITE);
-      display.setCursor(12, 27);
-      display.setTextSize(2);
-      String text = displayText(cue);
-      // Use a fixed number of cells so long words stay inside the tally field.
-      for (unsigned int i = 0; i < min(text.length(), 17u * 4u); i += 17) {
-        display.drawString(text.substring(i, i + 17), 12, 28 + (i / 17) * 17);
+      int y = testMode || beamerLive ? 46 : 28;
+      if (textMode != 0) {
+        int tally = textMode == 1 ? (showOutside ? outside : inside) : (showInside ? inside : outside);
+        display.fillRect(8, y, 224, 30, TFT_BLACK);
+        display.setTextColor(TFT_WHITE);
+        display.setTextSize(3);
+        display.setTextDatum(top_center);
+        display.drawString(states[tally], 120, y + 3);
+        display.setTextDatum(top_left);
+      } else {
+        display.setTextSize(2);
+        String text = displayText(cue);
+        unsigned int lines = y == 28 ? 3 : 2;
+        unsigned int columns = 17, lineHeight = 17;
+        if (text.length() > columns * lines) {
+          display.setTextSize(1);
+          columns = 36;
+          lineHeight = 9;
+          lines = (80 - y) / lineHeight;
+        }
+        for (unsigned int i = 0; i < min(text.length(), columns * lines); i += columns)
+          display.drawString(text.substring(i, i + columns), 12, y + (i / columns) * lineHeight);
       }
-      if (requireAck && !chatId.isEmpty()) {
-        display.setTextSize(1);
+      display.setTextSize(1);
+      if (textMode == 0 && requireAck && !chatId.isEmpty()) {
         display.drawString(confirmedAck == chatId ? "Quittiert" :
-            pendingAck == chatId ? "Warte auf PC" : "B: quittieren", 145, 102);
+            pendingAck == chatId ? "Warte auf PC" : "B: quittieren", 12, 125);
       }
-      if (shownId != chatId) {
+      if (textMode == 0 && shownId != chatId) {
         shownId = chatId;
         if (!chatId.isEmpty())
           send("TP1|chat_rcpt|" + deviceId + "|" + session + "|" + chatId + "|shown");
@@ -1082,11 +1140,18 @@ void loop() {
     updateConfig(now);
   }
   bool handlingProfile = profileButtons(now);
+  if (presentationAt && now - presentationAt >= 1500) {
+    presentationAt = 0;
+    textMode = 0;
+    beamerLive = false;
+    insideLive = outsideLive = "";
+    dirty = true;
+  }
   if (!handlingProfile && M5.BtnA.wasClicked()) {
     diagnostics = !diagnostics;
     dirty = true;
   }
-  if (!handlingProfile && M5.BtnB.wasClicked() && !diagnostics && sequence &&
+  if (!handlingProfile && M5.BtnB.wasClicked() && !diagnostics && sequence && textMode == 0 &&
       requireAck && !chatId.isEmpty() && shownId == chatId && confirmedAck != chatId) {
     pendingAck = chatId;
     send("TP1|chat_rcpt|" + deviceId + "|" + session + "|" + chatId + "|ack");

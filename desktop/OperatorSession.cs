@@ -26,8 +26,25 @@ internal sealed record Simulation(Scenario Scenario, int PeriodMs, int Atem, int
 
 internal sealed record ActiveChat(string Id, bool RequireAck, long? Deadline);
 internal sealed record ClosedChat(string Device, string Id, string Result, DateTimeOffset Time);
+internal sealed record PagerControl(bool ManualAtem = false, bool ManualVmix = false, int Atem = 1, int Vmix = 1,
+    bool Beamer = false, int TextMode = 0, bool ShowLive = false);
 internal sealed class OperatorSession(PilotCore core, ProfileStore? profiles = null)
 {
+    private readonly Dictionary<string, PagerControl> controls = [];
+    private bool manualDefault;
+    public PagerControl Control(string id) => controls.GetValueOrDefault(id) ?? new(manualDefault, manualDefault);
+    public void SetControl(string id, PagerControl value)
+    {
+        if (value.Atem is < 1 or > 3 || value.Vmix is < 1 or > 3 || value.TextMode is < 0 or > 2)
+            throw new ArgumentOutOfRangeException(nameof(value));
+        controls[id] = value;
+    }
+    public void SetAllManual(bool manual)
+    {
+        manualDefault = manual;
+        foreach (var pager in core.Devices)
+            SetControl(pager.Id, Control(pager.Id) with { ManualAtem = manual, ManualVmix = manual });
+    }
     private readonly Dictionary<string, (string Chat, string Next)> texts = [];
     private readonly Dictionary<string, Simulation> simulations = [];
     private readonly Dictionary<string, ActiveChat> messages = [];
@@ -58,6 +75,8 @@ internal sealed class OperatorSession(PilotCore core, ProfileStore? profiles = n
         foreach (string id in messages.Keys.ToArray()) Close(id, "Profilwechsel");
         simulations.Clear();
         texts.Clear();
+        controls.Clear();
+        manualDefault = false;
     }
 
     private void Close(string id, string result)
@@ -104,10 +123,26 @@ internal sealed class OperatorSession(PilotCore core, ProfileStore? profiles = n
             }
             var (chat, next) = Text(pager.Id);
             var message = Message(pager.Id);
+            var control = Control(pager.Id);
             string messageId = message?.Id ?? "";
             bool ack = message?.RequireAck == true;
             string insideSource = Label(inside.Mixer);
             string outsideSource = Label(outside.Mixer);
+            bool Manual(Assignment assignment) => assignment.Mixer switch
+            {
+                MixerKind.Atem or MixerKind.ArbiterAtem => control.ManualAtem,
+                MixerKind.Vmix or MixerKind.ArbiterVmix => control.ManualVmix,
+                _ => false
+            };
+            int State(Assignment assignment) => Manual(assignment)
+                ? assignment.Mixer is MixerKind.Atem or MixerKind.ArbiterAtem ? control.Atem : control.Vmix
+                : Resolve(assignment, atem, vmix, arbiter);
+            Preview Present(Preview view) => view with
+            {
+                TextMode = control.TextMode, Beamer = control.Beamer,
+                InsideLive = control.ShowLive ? LiveInputs(inside, atem, vmix, arbiter, Manual(inside)) : "",
+                OutsideLive = control.ShowLive ? LiveInputs(outside, atem, vmix, arbiter, Manual(outside)) : ""
+            };
             simulations.TryGetValue(pager.Id, out var simulation);
             if (simulation is { Scenario: Scenario.PagerCheck } && now - simulation.Started >= 6000)
             {
@@ -119,7 +154,7 @@ internal sealed class OperatorSession(PilotCore core, ProfileStore? profiles = n
                 var (a, v, pause) = simulation.State(now);
                 if (simulation.Scenario == Scenario.PagerCheck)
                 {
-                    core.SetPreview(pager.Id, new(a, v, chat, next, true, ChatId: messageId, RequireAck: ack));
+                    core.SetPreview(pager.Id, Present(new(a, v, chat, next, true, ChatId: messageId, RequireAck: ack)));
                     continue;
                 }
                 int Simulate(Assignment assignment) => assignment.Mixer switch
@@ -127,12 +162,33 @@ internal sealed class OperatorSession(PilotCore core, ProfileStore? profiles = n
                     MixerKind.Atem or MixerKind.ArbiterAtem => a,
                     MixerKind.Vmix or MixerKind.ArbiterVmix => v, _ => 0
                 };
-                core.SetPreview(pager.Id, new(Simulate(inside), Simulate(outside), chat, next, true,
-                    insideSource, outsideSource, messageId, ack), pause);
+                core.SetPreview(pager.Id, Present(new(Simulate(inside), Simulate(outside), chat, next, true,
+                    insideSource, outsideSource, messageId, ack)) with
+                    { InsideLive = control.ShowLive ? insideSource + ": Simulation" : "",
+                      OutsideLive = control.ShowLive ? outsideSource + ": Simulation" : "" }, pause);
             }
-            else core.SetPreview(pager.Id, new(Resolve(inside, atem, vmix, arbiter), Resolve(outside, atem, vmix, arbiter),
-                chat, next, false, insideSource, outsideSource, messageId, ack));
+            else core.SetPreview(pager.Id, Present(new(State(inside), State(outside),
+                chat, next, false, insideSource, outsideSource, messageId, ack)));
         }
+    }
+
+    private static string LiveInputs(Assignment assignment, MixerState atem, MixerState vmix, ArbiterState? arbiter, bool manual)
+    {
+        if (assignment.Mixer == MixerKind.Off) return "";
+        string label = Label(assignment.Mixer);
+        if (manual) return label + ": manuell";
+        MixerInput[] inputs = assignment.Mixer switch
+        {
+            MixerKind.Atem => atem.Inputs, MixerKind.Vmix => vmix.Inputs,
+            _ => arbiter?.For(assignment.Mixer) ?? []
+        };
+        if (inputs.Length == 0) return label + ": unbekannt";
+        var own = FindInput(assignment, atem, vmix, arbiter);
+        var live = inputs.Where(input => input.Tally == 3 && input != own).ToArray();
+        string text = live.Length == 0 ? label + ": kein anderer LIVE" :
+            label + ": " + live[0].Number + " " + live[0].Name + (live.Length > 1 ? $" (+{live.Length - 1})" : "");
+        // The display has room for 36 single-width cells per line.
+        return string.Concat(text.EnumerateRunes().Take(36).Select(rune => rune.ToString()));
     }
 
     internal static string Label(MixerKind kind) => kind switch

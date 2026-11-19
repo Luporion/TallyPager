@@ -252,7 +252,7 @@ internal sealed partial class MainWindow
     private void RefreshConnectionTools()
     {
         RefreshWindowsBluetooth();
-        if (tabs.SelectedTab == setup && remoteProfile.Visible) RefreshRemoteModes();
+        if (remoteModesDialog is { Visible: true }) RefreshRemoteModes();
         if (activeRadio?.Failure is { } failure) DisconnectBase("USB-Funkbasis getrennt · " + failure);
         if (activeRadio is { } bridge && Environment.TickCount64 - lastBasePreview >= 1000)
         {
