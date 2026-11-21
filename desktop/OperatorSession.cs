@@ -27,7 +27,7 @@ internal sealed record Simulation(Scenario Scenario, int PeriodMs, int Atem, int
 internal sealed record ActiveChat(string Id, bool RequireAck, long? Deadline);
 internal sealed record ClosedChat(string Device, string Id, string Result, DateTimeOffset Time);
 internal sealed record PagerControl(bool ManualAtem = false, bool ManualVmix = false, int Atem = 1, int Vmix = 1,
-    bool Beamer = false, int TextMode = 0, bool ShowLive = false);
+    bool Beamer = false, int TextMode = 0, bool ShowLive = false, bool ShowOwnTally = true);
 internal sealed class OperatorSession(PilotCore core, ProfileStore? profiles = null)
 {
     private readonly Dictionary<string, PagerControl> controls = [];
@@ -139,10 +139,14 @@ internal sealed class OperatorSession(PilotCore core, ProfileStore? profiles = n
                 : Resolve(assignment, atem, vmix, arbiter);
             Preview Present(Preview view) => view with
             {
-                TextMode = control.TextMode, Beamer = control.Beamer,
-                InsideLive = control.ShowLive ? LiveInputs(inside, atem, vmix, arbiter, Manual(inside)) : "",
-                OutsideLive = control.ShowLive ? LiveInputs(outside, atem, vmix, arbiter, Manual(outside)) : ""
+                TextMode = control.TextMode, Beamer = control.Beamer, ShowOwnTally = control.ShowOwnTally,
+                InsideLive = OtherLive(inside, view.Inside, view.Test),
+                OutsideLive = OtherLive(outside, view.Outside, view.Test)
             };
+            string OtherLive(Assignment assignment, int ownState, bool test) =>
+                control.ShowLive && ownState != 3 && assignment.Mixer != MixerKind.Off
+                    ? (test ? Label(assignment.Mixer) + ": Simulation" : LiveInputs(assignment, atem, vmix, arbiter, Manual(assignment)))
+                    : "";
             simulations.TryGetValue(pager.Id, out var simulation);
             if (simulation is { Scenario: Scenario.PagerCheck } && now - simulation.Started >= 6000)
             {
@@ -163,9 +167,7 @@ internal sealed class OperatorSession(PilotCore core, ProfileStore? profiles = n
                     MixerKind.Vmix or MixerKind.ArbiterVmix => v, _ => 0
                 };
                 core.SetPreview(pager.Id, Present(new(Simulate(inside), Simulate(outside), chat, next, true,
-                    insideSource, outsideSource, messageId, ack)) with
-                    { InsideLive = control.ShowLive ? insideSource + ": Simulation" : "",
-                      OutsideLive = control.ShowLive ? outsideSource + ": Simulation" : "" }, pause);
+                    insideSource, outsideSource, messageId, ack)), pause);
             }
             else core.SetPreview(pager.Id, Present(new(State(inside), State(outside),
                 chat, next, false, insideSource, outsideSource, messageId, ack)));

@@ -26,7 +26,7 @@ internal sealed record UsbSettings(string Id, string Name, string Host, string S
 
 internal static class PagerUsb
 {
-    public const string Version = "0.10.0";
+    public const string Version = "0.10.2";
     public const string FirmwareFileName = "TallyPager-Firmware-M5StickC-Plus2-" + Version + ".zip";
     public const string Esp8266FirmwareFileName = "TallyPager-Firmware-ESP8266-" + Version + ".zip";
     private const string StatusPrefix = "TP ";

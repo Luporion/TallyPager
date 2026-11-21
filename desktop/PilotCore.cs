@@ -13,11 +13,16 @@ internal sealed record Pager(string Id, string Name, string Key, Assignment? Ins
     string? ConfiguredTransport = null);
 internal sealed record Preview(int Inside, int Outside, string Chat, string Next, bool Test = false,
     string InsideSource = "Innen", string OutsideSource = "Aussen", string ChatId = "", bool RequireAck = false,
-    int TextMode = 0, bool Beamer = false, string InsideLive = "", string OutsideLive = "")
+    int TextMode = 0, bool Beamer = false, string InsideLive = "", string OutsideLive = "", bool ShowOwnTally = true)
 {
     public static Preview Clear { get; } = new(0, 0, "", "");
 }
 internal enum Connection { Disconnected, Delayed, Connected }
+internal readonly record struct DisplayPowerSettings(int Brightness, bool DimSafe, bool DimUnchanged)
+{
+    public const int Minimum = 10, Maximum = 100;
+    public int Flags => (DimSafe ? 1 : 0) | (DimUnchanged ? 2 : 0);
+}
 internal readonly record struct DeviceSlot(int Number, string Mode, string? Gateway = null, int Channel = 0)
 {
     public override string ToString() => $"Profil {Number + 1} · {Transport.Name(Mode)}";
@@ -97,6 +102,11 @@ internal sealed class PilotCore : IDisposable
         public bool Testing { get; set; }
         public TaskCompletionSource<string> Completion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
+    private sealed record DisplayRequest(uint Counter, string Session, string Command, DisplayPowerSettings? Expected, long Deadline)
+    {
+        public long LastSent { get; set; } = -6000;
+        public TaskCompletionSource<DisplayPowerSettings> Completion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
     private sealed class Link(Pager pager)
     {
         public Pager Pager { get; set; } = pager;
@@ -129,6 +139,8 @@ internal sealed class PilotCore : IDisposable
         public string? DiscoverNonce { get; set; }
         public long DiscoverUntil { get; set; }
         public uint ConfigCounter { get; set; }
+        public uint DisplayCounter { get; set; }
+        public DisplayRequest? DisplayChange { get; set; }
         public ConfigRequest? Configuration { get; set; }
         public SlotRequest? SlotChange { get; set; }
         public DeviceSlot[] Slots { get; set; } = [];
@@ -287,6 +299,7 @@ internal sealed class PilotCore : IDisposable
         {
             RetryConfiguration(link, now);
             RetrySlot(link, now);
+            RetryDisplay(link, now);
             if (now - Math.Max(link.SeenAt, link.HandshakeAt) < 5000)
             {
                 SendState(link);
@@ -342,6 +355,43 @@ internal sealed class PilotCore : IDisposable
         link.SlotChange = request;
         RetrySlot(link, now);
         return request.Completion.Task;
+    }
+
+    public Task<DisplayPowerSettings> RequestDisplayPower(string id, DisplayPowerSettings? settings = null)
+    {
+        if (settings is { Brightness: < DisplayPowerSettings.Minimum or > DisplayPowerSettings.Maximum })
+            throw new ArgumentOutOfRangeException(nameof(settings));
+        long now = Environment.TickCount64;
+        if (!devices.TryGetValue(id, out var link) || link.Active is not { } active || now - link.SeenAt >= 3500 || link.Paused)
+            throw new InvalidOperationException("Der Stick braucht eine aktive Tally-Verbindung.");
+        if (link.Firmware?.Supports(FirmwareInfo.DisplayPower) != true)
+            throw new InvalidOperationException("Fernsteuerung der Helligkeit benötigt M5Stick-Firmware ab 0.10.2.");
+        if (link.DisplayChange is not null)
+            throw new InvalidOperationException("Für diesen Stick läuft bereits eine Display-Anfrage.");
+
+        uint counter = ++link.DisplayCounter;
+        string command = FormattableString.Invariant($"TP1|display_cfg|{id}|{active.Session}|{counter}");
+        if (settings is { } requested)
+            command += FormattableString.Invariant($"|{requested.Brightness}|{requested.Flags}");
+        var pending = new DisplayRequest(counter, active.Session, command, settings, now + 5000);
+        link.DisplayChange = pending;
+        RetryDisplay(link, now);
+        return pending.Completion.Task;
+    }
+
+    private void RetryDisplay(Link link, long now)
+    {
+        if (link.DisplayChange is not { } pending) return;
+        if (link.Active is not { } active || active.Session != pending.Session || now >= pending.Deadline)
+        {
+            link.DisplayChange = null;
+            pending.Completion.TrySetException(new TimeoutException("Keine Bestätigung vom Stick. Lade den aktuellen Stand erneut."));
+            return;
+        }
+        if (now - pending.LastSent < 750) return;
+        pending.LastSent = now;
+        try { Send(link, active.Endpoint, pending.Command); }
+        catch (SocketException) { } // Retry transport errors until the deadline.
     }
 
     private void RetrySlot(Link link, long now)
@@ -488,6 +538,7 @@ internal sealed class PilotCore : IDisposable
             link.ActiveSlot = null;
             link.LastAddress = source.Ip?.Address.ToString() ?? Transport.DisplayAddress(source.Mac);
             link.ConfigCounter = 0;
+            link.DisplayCounter = 0;
             link.Transport = source.Bridge?.Mode ?? "udp";
             link.HandshakeAt = now;
             link.ClockAt = -60000;
@@ -503,6 +554,18 @@ internal sealed class PilotCore : IDisposable
                 link.PresentationSeen = shown;
             else if (fields[1] == "firmware")
                 ObserveFirmware(link, ParseFirmware(fields));
+            else if (fields is [_, "display_settings", _, _, var displayCounter, var level, var flags, "ok" or "error"] &&
+                link.DisplayChange is { } display && display.Session == active.Session &&
+                uint.TryParse(displayCounter, NumberStyles.None, CultureInfo.InvariantCulture, out uint received) && received == display.Counter &&
+                InRange(level, DisplayPowerSettings.Minimum, DisplayPowerSettings.Maximum) is int brightness &&
+                InRange(flags, 0, 3) is int bits)
+            {
+                link.DisplayChange = null;
+                var actual = new DisplayPowerSettings(brightness, (bits & 1) != 0, (bits & 2) != 0);
+                if (fields[7] == "ok" && (display.Expected is null || display.Expected == actual))
+                    display.Completion.TrySetResult(actual);
+                else display.Completion.TrySetException(new InvalidOperationException("Der Stick hat die gewünschte Einstellung nicht gespeichert."));
+            }
             else if (fields is [_, "slots", _, _, var slot, var entries] && InRange(slot, 0, 3) is int current)
             {
                 link.ActiveSlot = current;
@@ -610,8 +673,13 @@ internal sealed class PilotCore : IDisposable
         }
         if (!Send(link, active.Endpoint, body)) return 0;
         if (link.Firmware?.Supports("presentation") == true)
-            Send(link, active.Endpoint, FormattableString.Invariant(
-                $"TP1|presentation|{link.Pager.Id}|{active.Session}|{link.Sequence}|{preview.TextMode}|{(preview.Beamer ? 1 : 0)}|{TextHex(preview.InsideLive)}|{TextHex(preview.OutsideLive)}"));
+        {
+            string presentation = FormattableString.Invariant(
+                $"TP1|presentation|{link.Pager.Id}|{active.Session}|{link.Sequence}|{preview.TextMode}|{(preview.Beamer ? 1 : 0)}|{TextHex(preview.InsideLive)}|{TextHex(preview.OutsideLive)}");
+            if (link.Firmware.Supports(FirmwareInfo.TallyLabels))
+                presentation += preview.ShowOwnTally ? "|1" : "|0";
+            Send(link, active.Endpoint, presentation);
+        }
         if (preview.ChatId.Length > 0) link.SentAt ??= DateTimeOffset.UtcNow;
         return link.Sequence;
     }

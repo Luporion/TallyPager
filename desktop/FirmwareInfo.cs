@@ -7,6 +7,8 @@ internal sealed class FirmwareInfo
     public const string Wifi = "wifi-config";
     public const string RadioBase = "radio-base";
     public const string RemoteSlots = "remote-slots";
+    public const string TallyLabels = "tally-labels";
+    public const string DisplayPower = "display-power";
     private static readonly Dictionary<string, string> Known = new(StringComparer.Ordinal)
     {
         [Usb] = "USB-Einrichtung",
@@ -25,7 +27,9 @@ internal sealed class FirmwareInfo
         ["base-preview"] = "Mini-Anzeige auf der Funkbasis",
         ["base-preview-details"] = "Mini-Vorschau mit Text und Verbindungsstatus",
         [RemoteSlots] = "Geräteprofil über Funk wechseln",
-        ["presentation"] = "Tally-Großtext, Beamer und Live-Inputs"
+        ["presentation"] = "Tally-Großtext, Beamer und Live-Inputs",
+        [TallyLabels] = "Eigene Tally-Texte ein- und ausblenden",
+        [DisplayPower] = "Helligkeit und automatisches Dimmen fernsteuern"
     };
     private static readonly string[] V04 = [Usb, "link-stats"];
     private static readonly string[] V05 = [.. V04, Acknowledge, "diagnostics"];

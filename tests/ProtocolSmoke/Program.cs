@@ -80,6 +80,7 @@ try
     TestAssignments(settings);
     TestManualPresentation(settings);
     TestPresentationProtocol(settings);
+    await TestDisplayPower(settings);
     TestRegieCheck(settings);
     await TestDiagnosticStorage(settings);
     TestProfiles(settings);
@@ -452,8 +453,8 @@ static void TestManualPresentation(string settings)
     session.Update(atem, vmix, 0);
     var view = core.Statuses().Single(pager => pager.Id == first.Id).View;
     Check(view is { Inside: 1, Outside: 3, Beamer: true, TextMode: 1 } &&
-        view.InsideLive.Contains("Andere Kamera") && view.OutsideLive == "ATEM: manuell",
-        "Manual source selection must respect swapped layers and retain external live names");
+        view.InsideLive.Contains("Andere Kamera") && view.OutsideLive == "",
+        "The other input must be hidden only on the layer where the pager itself is live");
     session.SetAllManual(true);
     session.SetControl(first.Id, session.Control(first.Id) with { ManualVmix = false });
     session.Update(MixerState.Off, MixerState.Off, 1);
@@ -462,14 +463,19 @@ static void TestManualPresentation(string settings)
         "Global manual control and per-source exceptions must survive mixer failure");
     session.Start([first.Id], new(Scenario.Manual, 1000, 2, 3, 0));
     session.Update(atem, vmix, 2);
-    Check(core.Statuses().Single(pager => pager.Id == first.Id).View is { Inside: 3, Outside: 2, Test: true, Beamer: true },
+    Check(core.Statuses().Single(pager => pager.Id == first.Id).View is
+        { Inside: 3, Outside: 2, Test: true, Beamer: true, InsideLive: "", OutsideLive: "ATEM: Simulation" },
         "Simulation must override manual tally and retain presentation controls");
     session.Stop([first.Id]);
-    session.SetControl(first.Id, new(ShowLive: true));
+    session.SetControl(first.Id, new(ShowLive: true, ShowOwnTally: false));
     session.Update(atem, vmix, 3);
     view = core.Statuses().Single(pager => pager.Id == first.Id).View;
-    Check(view.Inside == 1 && view.Outside == 1 && view.OutsideLive.Contains("Cam 2"),
+    Check(view is { Inside: 1, Outside: 1, ShowOwnTally: false } && view.OutsideLive.Contains("Cam 2"),
         "Returning to external sources must restore real source state and the other live input");
+    session.Update(atem, new("Verbunden", [new(2, "Cam 2", 3), new(9, "Andere Kamera", 3)]), 4);
+    view = core.Statuses().Single(pager => pager.Id == first.Id).View;
+    Check(view.InsideLive == "" && view.OutsideLive.Contains("Cam 2"),
+        "An external live tally must hide the other inputs even if several inputs are live");
     session.Reset();
     Check(session.Control(first.Id) == new PagerControl(), "Profile reset must clear temporary manual states and beamer");
     // Restore the fixture for subsequent one-device tests.
@@ -500,7 +506,73 @@ static void TestPresentationProtocol(string settings)
     Send(stick, core, receipt, Tag(receipt, key));
     core.Tick();
     Check(core.Statuses().Single(pager => pager.Id == id).PreviewReceived, "Display receipt must confirm the matching presentation");
+    Check(frame.Length == 9, "Older presentation firmware must receive its original packet");
+    firmware += ",tally-labels";
+    Send(stick, core, firmware, Tag(firmware, key));
+    core.Tick();
+    core.SetPreview(id, new(3, 1, "Chat", "", ShowOwnTally: false));
+    do { frame = Read(stick, core, key); } while (frame[1] != "presentation" || frame.Length != 10);
+    Check(frame[9] == "0", "The new M5 firmware must receive the switch to hide its own tally labels");
+    core.SetPreview(id, Preview.Clear);
+    do { frame = Read(stick, core, key); } while (frame[1] != "presentation" || frame.Length != 10 || frame[9] != "1");
     Console.WriteLine("PASS authenticated presentation feature negotiation and separate display confirmation");
+}
+
+static async Task TestDisplayPower(string settings)
+{
+    using var core = new PilotCore(settings, 0);
+    using var stick = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+    string key = core.Devices.Single(pager => pager.Id == id).Key;
+    string session = Connect(stick, core, key, new string('e', 32));
+    void Receive(string body) => Send(stick, core, body, Tag(body, key));
+    Receive($"TP1|seen|{id}|{session}|1|80");
+    Receive($"TP1|firmware|{id}|{session}|0.10.1|presentation,tally-labels");
+    core.Tick();
+    try
+    {
+        _ = core.RequestDisplayPower(id);
+        throw new Exception("The Core offered display power control to old firmware");
+    }
+    catch (InvalidOperationException) { }
+    Receive($"TP1|firmware|{id}|{session}|{PagerUsb.Version}|display-power");
+    core.Tick();
+
+    string[] ReadCommand()
+    {
+        var timeout = Stopwatch.StartNew();
+        while (timeout.ElapsedMilliseconds < 1500)
+        {
+            var frame = Read(stick, core, key);
+            if (frame[1] == "display_cfg") return frame;
+        }
+        throw new TimeoutException("The Core did not send a display command");
+    }
+
+    var query = core.RequestDisplayPower(id);
+    var command = ReadCommand();
+    Check(command.SequenceEqual(new[] { "TP1", "display_cfg", id, session, "1" }), "Invalid display read command");
+    var retry = ReadCommand();
+    Check(retry.SequenceEqual(command), "A lost reply must retry the same display command counter");
+    string reply = $"TP1|display_settings|{id}|{session}|1|63|0|ok";
+    Send(stick, core, reply, new string('0', 64));
+    core.Tick();
+    Check(!query.IsCompleted, "Unsigned display replies must not complete the request");
+    Receive(reply);
+    core.Tick();
+    Check(await query == new DisplayPowerSettings(63, false, false), "Unexpected display settings readback");
+
+    var change = new DisplayPowerSettings(40, true, true);
+    var save = core.RequestDisplayPower(id, change);
+    Check(ReadCommand().SequenceEqual(new[] { "TP1", "display_cfg", id, session, "2", "40", "3" }),
+        "Display update must include the brightness and both flags");
+    Receive(reply);
+    Receive($"TP1|display_settings|{id}|{session}|2|9|3|ok");
+    core.Tick();
+    Check(!save.IsCompleted, "Stale or malformed replies must not confirm a display update");
+    Receive($"TP1|display_settings|{id}|{session}|2|40|3|ok");
+    core.Tick();
+    Check(await save == change, "The stick must confirm the actual saved brightness and flags");
+    Console.WriteLine("PASS per-pager display settings, firmware gating, signed readback and idempotent retries");
 }
 
 static void TestBasePreview(string settings)
@@ -571,6 +643,16 @@ static void TestRadioBridge(string settings)
         }
         Check(bridge.Outbound.Any(frame => frame.Payload.StartsWith($"TP1|clock|{id}|{session}|")),
             "Clock must use the authenticated active radio session");
+        Push($"TP1|firmware|{id}|{session}|{PagerUsb.Version}|display-power");
+        core.Tick();
+        var displayChange = core.RequestDisplayPower(id, new(50, true, false));
+        string command = $"TP1|display_cfg|{id}|{session}|1|50|1";
+        Check(bridge.Outbound.Any(frame => frame.Address == address && frame.Payload == command + "|" + Tag(command, key)),
+            "Display update must follow the stick's radio link");
+        Push($"TP1|display_settings|{id}|{session}|1|50|1|ok");
+        core.Tick();
+        Check(displayChange.IsCompletedSuccessfully && displayChange.Result == new DisplayPowerSettings(50, true, false),
+            "Display update must confirm through the same radio bridge");
         core.AttachRadio(null);
         Check(bridge.Closed && !core.Statuses().Single().Online, "Detach must invalidate the radio session");
     }

@@ -15,11 +15,15 @@ namespace {
 constexpr uint16_t port = 46224;
 constexpr uint16_t managementPort = 46226;
 constexpr uint32_t staleAfter = 1500;
+constexpr uint8_t defaultBrightness = 63;
+constexpr uint8_t dimSafe = 1, dimUnchanged = 2;
+constexpr uint32_t safeDimAfter = 30000, unchangedDimAfter = 120000;
+constexpr char displayPowerFeature[] = "display-power";
 constexpr size_t maxPacket = 900;
 constexpr char hexDigits[] = "0123456789abcdef";
 constexpr const char* firmwareFeatures[] = {"usb-config", "chat-ack", "link-stats", "diagnostics",
     "wifi-config", "wifi-discovery", "radio-base", "espnow", "espnow-lr", "ble",
-    "usb-read-settings", "clock", "device-slots", "base-preview", "base-preview-details", "remote-slots", "presentation"};
+    "usb-read-settings", "clock", "device-slots", "base-preview", "base-preview-details", "remote-slots", "presentation", "tally-labels"};
 WiFiUDP udp, management;
 IPAddress core;
 String deviceId, name, ssid, password, nonce, session, cue, next, serialLine;
@@ -44,28 +48,53 @@ uint32_t snapshotLoss = 0, lastStaleAge = 0, missedStates = 0, lastDiagnostic = 
 uint32_t snapshotLostAt = 0, snapshotDowntime = 0;
 uint8_t key[32]{};
 uint8_t inside = 0, outside = 0;
-uint32_t sequence = 0, lastState = 0, offeredAt = 0, lastSend = 0, lastDraw = 0;
+uint32_t sequence = 0, lastState = 0, offeredAt = 0, lastSend = 0;
 uint32_t restartAt = 0;
 uint32_t lastPing = 0, pendingPing = 0, lastPong = 0, telemetrySequence = 0;
 uint32_t lastLinkCheck = 0;
+uint32_t lastDiagnosticCheck = 0;
 uint32_t connectedAt = 0;
 int rtt = -1;
 bool configured = false, udpReady = false, diagnostics = false, dirty = true, serialOverflow = false;
+uint8_t brightness = defaultBrightness, dimFlags = 0;
+int appliedBrightness = -1;
+uint32_t displayActivityAt = 0, displayCounter = 0;
+bool displaySaved = true;
 bool testMode = false;
 int textMode = 0;
-bool beamerLive = false;
+bool beamerLive = false, showOwnTally = true;
 String insideLive, outsideLive;
 uint32_t presentationSequence = 0, presentationAt = 0;
 int activeSlot = 0, chosenSlot = -1;
 String slotRequest, slotOutcome, trialConfig;
+enum class ModeNotice { None, Restarting, Changed, Rollback };
+ModeNotice modeNotice = ModeNotice::None;
+String noticeMode;
+uint32_t modeNoticeUntil = 0;
+bool trialChangesMode = false;
 uint32_t trialDeadline = 0;
 uint32_t menuHeld = 0, menuTouched = 0, clockAt = 0, clockSeconds = 0;
 int lastMinute = -1;
 bool clockSynced = false, menuArmed = false, menuAttempted = false;
+struct LinkDisplay {
+  int bars = -1, rtt = -1;
+  bool online = false, delayed = false, notice = false;
+};
+LinkDisplay displayedLink;
+struct DiagnosticDisplay {
+  IPAddress ip;
+  int rtt = -1, rssi = 0, battery = 0;
+};
+DiagnosticDisplay displayedDiagnostics;
 struct BaseLine {
   String name, text, badge;
   uint8_t inside = 0, outside = 0;
   bool online = false, insideEnabled = true, outsideEnabled = true;
+  bool operator==(const BaseLine& other) const {
+    return name == other.name && text == other.text && badge == other.badge &&
+        inside == other.inside && outside == other.outside && online == other.online &&
+        insideEnabled == other.insideEnabled && outsideEnabled == other.outsideEnabled;
+  }
 };
 BaseLine baseLines[4];
 size_t baseCount = 0;
@@ -166,6 +195,8 @@ void newSession() {
   requireAck = false;
   lastDiagnostic = 0;
   configCounter = 0;
+  displayCounter = 0;
+  displayActivityAt = millis();
   dirty = true;
 }
 
@@ -189,7 +220,42 @@ String firmwareMessage(const String& currentSession) {
     if (i > 0) body += ',';
     body += firmwareFeatures[i];
   }
+  if (!baseRole) { body += ','; body += displayPowerFeature; }
   return body;
+}
+
+void handleDisplaySettings(String* fields, size_t count, uint32_t now) {
+  const String& value = fields[4];
+  if (value.isEmpty() || value.length() > 10) return;
+  for (unsigned int i = 0; i < value.length(); ++i)
+    if (value[i] < '0' || value[i] > '9') return;
+  uint64_t candidate = strtoull(value.c_str(), nullptr, 10);
+  if (!candidate || candidate > UINT32_MAX || candidate < displayCounter) return;
+
+  if (candidate > displayCounter) {
+    displayCounter = static_cast<uint32_t>(candidate);
+    displaySaved = true;
+    if (count == 7) {
+      int level = fields[5].toInt(), flags = fields[6].toInt();
+      displaySaved = level >= 10 && level <= 100 && flags >= 0 && flags <= 3 &&
+          fields[5] == String(level) && fields[6] == String(flags);
+      if (displaySaved && (level != brightness || flags != dimFlags)) {
+        Preferences prefs;
+        displaySaved = prefs.begin("tallypilot", false);
+        if (displaySaved) {
+          displaySaved = prefs.putUShort("displayPower", (flags << 8) | level) == sizeof(uint16_t);
+          prefs.end();
+        }
+        if (displaySaved) {
+          brightness = level;
+          dimFlags = flags;
+          displayActivityAt = now;
+        }
+      }
+    }
+  }
+  send("TP1|display_settings|" + deviceId + "|" + session + "|" + value + "|" +
+      String(brightness) + "|" + String(dimFlags) + "|" + (displaySaved ? "ok" : "error"));
 }
 
 void receive(uint32_t now) {
@@ -225,22 +291,31 @@ void receive(uint32_t now) {
       rtt = now - pendingPing;
       lastPong = now;
       pendingPing = 0;
-      dirty = true;
     }
     if (session.isEmpty() || count < 5 || fields[3] != session) continue;
-    if (count == 9 && fields[1] == "presentation") {
+    if (sequence && (count == 5 || count == 7) && fields[1] == "display_cfg") {
+      handleDisplaySettings(fields, count, now);
+      continue;
+    }
+    if ((count == 9 || count == 10) && fields[1] == "presentation") {
       char* end = nullptr;
       unsigned long number = strtoul(fields[4].c_str(), &end, 10);
       String first, second;
       if (end == fields[4].c_str() || *end || !sequence || number != sequence || number < presentationSequence ||
           (fields[5] != "0" && fields[5] != "1" && fields[5] != "2") ||
           (fields[6] != "0" && fields[6] != "1") ||
+          (count == 10 && fields[9] != "0" && fields[9] != "1") ||
           !decodeText(fields[7], first, 144) || !decodeText(fields[8], second, 144)) continue;
       int selected = fields[5].toInt();
       bool beamer = fields[6] == "1";
-      dirty |= textMode != selected || beamerLive != beamer || insideLive != first || outsideLive != second;
+      bool own = count == 9 || fields[9] == "1";
+      bool viewChanged = textMode != selected || beamerLive != beamer || showOwnTally != own;
+      dirty |= viewChanged || (insideSource != "off" && inside != 3 && insideLive != first) ||
+          (outsideSource != "off" && outside != 3 && outsideLive != second);
+      if (viewChanged) displayActivityAt = now;
       textMode = selected;
       beamerLive = beamer;
+      showOwnTally = own;
       insideLive = first;
       outsideLive = second;
       presentationSequence = number;
@@ -260,7 +335,6 @@ void receive(uint32_t now) {
         clockSeconds = seconds;
         clockAt = now;
         clockSynced = true;
-        dirty = true;
       }
       continue;
     }
@@ -299,10 +373,14 @@ void receive(uint32_t now) {
       }
     }
     bool newRequireAck = count == 14 && fields[13] == "1";
-    dirty |= sequence == 0 || newInside != inside || newOutside != outside || cue != newCue ||
+    if (sequence == 0 || (newInsideSource != "off" && newInside != inside) ||
+        (newOutsideSource != "off" && newOutside != outside) || cue != newCue ||
         next != newNext || simulation != testMode || chatId != newChatId ||
         requireAck != newRequireAck ||
-        insideSource != newInsideSource || outsideSource != newOutsideSource;
+        insideSource != newInsideSource || outsideSource != newOutsideSource) {
+      dirty = true;
+      displayActivityAt = now;
+    }
     if (sequence > 0 && number > sequence + 1) missedStates += number - sequence - 1;
     if (pendingAck != newChatId) pendingAck = "";
     if (confirmedAck != newChatId) confirmedAck = "";
@@ -351,7 +429,6 @@ void network(uint32_t now) {
   }
   if (rtt >= 0 && now - lastPong > 6000) {
     rtt = -1;
-    dirty = true;
   }
   if (lastSend != 0 && now - lastSend < (live ? 1000 : 350)) return;
   if (session.isEmpty()) {
@@ -450,6 +527,29 @@ void reportSlotResult() {
     send("TP1|slot_result|" + deviceId + "|" + session + "|" + slotRequest + "|" + slotOutcome);
 }
 
+void showModeNotice(ModeNotice notice, const String& target) {
+  modeNotice = notice;
+  noticeMode = target;
+  modeNoticeUntil = millis() + 2600;
+  dirty = true;
+}
+
+void restartForMode(const String& target, uint32_t now, bool remember) {
+  if (target == mode || target.isEmpty()) {
+    restartAt = now + 350;
+    return;
+  }
+  if (remember) {
+    Preferences prefs;
+    if (prefs.begin("tallypilot", false)) {
+      prefs.putString("radioNotice", target);
+      prefs.end();
+    }
+  }
+  showModeNotice(ModeNotice::Restarting, target);
+  restartAt = now + 1150;
+}
+
 void reportSlots() {
   Preferences prefs;
   if (!prefs.begin("tallypilot", true)) return;
@@ -480,6 +580,7 @@ void handleSlot(const String& request, const String& slot, uint32_t now) {
   }
   int selected = slot[0] - '0';
   bool prepared = false;
+  String target;
   Preferences prefs;
   if (selected != activeSlot && prefs.begin("tallypilot", false)) {
     JsonDocument doc;
@@ -487,14 +588,16 @@ void handleSlot(const String& request, const String& slot, uint32_t now) {
     String marker = request + slot;
     if (!deserializeJson(doc, candidate) && settings(doc, false, false) &&
         doc["slot"].as<int>() == selected && String(doc["key"] | "") == hex(key, sizeof(key)) &&
-        prefs.putString("slotRequest", request) == request.length())
+        prefs.putString("slotRequest", request) == request.length()) {
+      target = doc["mode"] | "udp";
       prepared = prefs.putString("slotTrial", marker) == marker.length();
+    }
     prefs.end();
   }
   slotRequest = request;
   slotOutcome = prepared ? "testing" : "rejected";
   reportSlotResult();
-  if (prepared) restartAt = now + 600;
+  if (prepared) restartForMode(target, now, false);
 }
 
 void loadSlotTrial(Preferences& prefs, JsonDocument& current) {
@@ -508,6 +611,7 @@ void loadSlotTrial(Preferences& prefs, JsonDocument& current) {
       marker[32] < '0' || marker[32] > '3') return;
   int selected = marker[32] - '0';
   JsonDocument candidate;
+  String previousMode = mode;
   if (deserializeJson(candidate, prefs.getString(slotKey(selected).c_str(), "")) ||
       candidate["slot"].as<int>() != selected || String(candidate["key"] | "") != hex(key, sizeof(key)) ||
       !settings(candidate, false)) return;
@@ -515,6 +619,19 @@ void loadSlotTrial(Preferences& prefs, JsonDocument& current) {
   serializeJson(candidate, trialConfig);
   trialDeadline = millis() + 30000;
   slotOutcome = "";
+  trialChangesMode = previousMode != mode;
+  if (trialChangesMode) showModeNotice(ModeNotice::Changed, mode);
+}
+
+void restartAfterTrialFailure(uint32_t now) {
+  if (trialChangesMode) {
+    Preferences prefs;
+    if (prefs.begin("tallypilot", false)) {
+      prefs.putString("radioNotice", "rollback");
+      prefs.end();
+    }
+  }
+  restartAt = now + 100;
 }
 
 void updateSlotTrial(uint32_t now) {
@@ -532,9 +649,9 @@ void updateSlotTrial(uint32_t now) {
         return;
       }
     }
-    restartAt = now + 100;
+    restartAfterTrialFailure(now);
   } else if (static_cast<int32_t>(now - trialDeadline) >= 0 && !restartAt) {
-    restartAt = now + 100;
+    restartAfterTrialFailure(now);
   }
 }
 
@@ -745,6 +862,7 @@ void status() {
   doc["board"] = "m5stick-cplus2";
   JsonArray features = doc["features"].to<JsonArray>();
   for (const char* feature : firmwareFeatures) features.add(feature);
+  if (!baseRole) features.add(displayPowerFeature);
   doc["id"] = deviceId;
   doc["configured"] = configured;
   doc["wifi"] = WiFi.status() == WL_CONNECTED;
@@ -809,10 +927,10 @@ void readUsbSettings() {
 void readBaseView(const char* payload) {
   JsonDocument view;
   if (deserializeJson(view, payload) || !view.is<JsonArray>()) return;
-  baseCount = 0;
+  size_t count = 0;
   for (JsonObject row : view.as<JsonArray>()) {
-    if (baseCount == 4) break;
-    auto& line = baseLines[baseCount++];
+    if (count == 4) break;
+    BaseLine line;
     line.name = String(row["name"] | "").substring(0, 24);
     line.inside = constrain(row["inside"] | 0, 0, 3);
     line.outside = constrain(row["outside"] | 0, 0, 3);
@@ -821,9 +939,15 @@ void readBaseView(const char* payload) {
     line.online = row["online"] | (line.inside != 0 || line.outside != 0);
     line.insideEnabled = row["insideOn"] | true;
     line.outsideEnabled = row["outsideOn"] | true;
+    if (!(baseLines[count] == line)) {
+      baseLines[count] = std::move(line);
+      dirty = true;
+    }
+    ++count;
   }
+  dirty |= count != baseCount;
+  baseCount = count;
   baseViewAt = millis();
-  dirty = true;
 }
 
 void serialInput() {
@@ -842,23 +966,26 @@ void serialInput() {
       JsonDocument doc;
       bool ok = !deserializeJson(doc, serialLine.c_str() + 10) && settings(doc, true);
       Serial.println(ok ? "TP OK" : "TP ERROR config");
-      if (ok) restartAt = millis() + 350;
+      if (ok) restartForMode(doc["mode"] | "udp", millis(), true);
     }
     if (!serialOverflow && serialLine.startsWith("TP BASE ")) {
       JsonDocument doc;
       bool ok = !deserializeJson(doc, serialLine.c_str() + 8) && baseConfig(doc, true);
       Serial.println(ok ? "TP OK" : "TP ERROR base");
-      if (ok) restartAt = millis() + 350;
+      if (ok) restartForMode(doc["mode"] | "espnow", millis(), true);
     }
     if (!serialOverflow && serialLine == "TP PAGER" && baseRole) {
       Preferences prefs;
       bool ok = false;
+      String target;
       if (prefs.begin("tallypilot", false)) {
-        ok = prefs.isKey("config") && prefs.remove("base");
+        JsonDocument doc;
+        ok = !deserializeJson(doc, prefs.getString("config", "")) && settings(doc, false, false) && prefs.remove("base");
+        if (ok) target = doc["mode"] | "udp";
         prefs.end();
       }
       Serial.println(ok ? "TP OK" : "TP ERROR pager");
-      if (ok) restartAt = millis() + 350;
+      if (ok) restartForMode(target, millis(), true);
     }
     if (!serialOverflow && baseRole && serialLine.startsWith("TP LINK ") && serialLine.length() > 21 &&
         serialLine[20] == ' ') {
@@ -887,10 +1014,110 @@ bool showReconnectNotice() {
   return sequence && millis() - connectedAt < 2200;
 }
 
+void updateBrightness(uint32_t now) {
+  uint32_t idle = now - displayActivityAt;
+  bool dim = false;
+  if (dimFlags && idle >= safeDimAfter && !baseRole && !diagnostics && chosenSlot < 0 &&
+      modeNotice == ModeNotice::None && sequence && !linkDelayed() && !restartAt &&
+      !(textMode == 0 && requireAck && !chatId.isEmpty() && confirmedAck != chatId)) {
+    bool insideOn = insideSource != "off", outsideOn = outsideSource != "off";
+    bool safe = (insideOn || outsideOn) && (!insideOn || inside == 1) && (!outsideOn || outside == 1) && !beamerLive;
+    dim = ((dimFlags & dimSafe) && safe) || ((dimFlags & dimUnchanged) && idle >= unchangedDimAfter);
+  }
+  int level = brightness * 255 / (dim ? 200 : 100);
+  if (level != appliedBrightness) {
+    StickCP2.Display.setBrightness(level);
+    appliedBrightness = level;
+  }
+}
+
+void drawLinkStatus(const LinkDisplay& link) {
+  auto& display = StickCP2.Display;
+  display.setTextDatum(top_left);
+  display.setTextSize(1);
+  display.fillRect(127, 0, 113, 18, TFT_BLACK);
+  for (int i = 0; mode == "udp" && i < 4; ++i) {
+    int height = 3 + 2 * i;
+    display.fillRect(128 + i * 5, 14 - height, 3, height, i < link.bars ? TFT_GREEN : 0x4208);
+  }
+  display.setTextColor(!link.online ? TFT_LIGHTGREY : link.delayed ? TFT_ORANGE : TFT_WHITE);
+  String connection = !link.online ? "Getrennt" : link.delayed ? "Delayed" : link.notice ? "Verbunden" : "";
+  if (link.rtt >= 0) {
+    if (!connection.isEmpty()) connection += " ";
+    connection += String(link.rtt) + "ms";
+  }
+  display.drawString(connection, mode == "udp" ? 148 : 128, 5);
+  display.setTextColor(TFT_WHITE);
+}
+
 String displayText(String text) {
   text.replace("ä", "ae"); text.replace("ö", "oe"); text.replace("ü", "ue");
   text.replace("Ä", "Ae"); text.replace("Ö", "Oe"); text.replace("Ü", "Ue"); text.replace("ß", "ss");
   return text;
+}
+
+String modeLabel(const String& target) {
+  if (target == "espnow") return "ESP-NOW";
+  if (target == "espnow-lr") return "ESP-NOW LR";
+  if (target == "ble") return "BLE";
+  return "WLAN + UDP";
+}
+
+void drawBeamer() {
+  auto& display = StickCP2.Display;
+  display.fillRoundRect(132, 18, 105, 39, 4, TFT_YELLOW);
+  display.setTextColor(TFT_BLACK);
+  display.setTextDatum(top_center);
+  display.setTextSize(2);
+  display.drawString("LIVE", 184, 19);
+  display.setTextSize(1);
+  display.drawString("auf BEAMER", 184, 34);
+  display.fillRoundRect(172, 43, 20, 9, 2, TFT_BLACK);
+  display.fillCircle(187, 47, 2, TFT_YELLOW);
+  display.drawLine(174, 52, 174, 54, TFT_BLACK);
+  display.drawLine(190, 52, 190, 54, TFT_BLACK);
+  display.drawLine(194, 45, 199, 43, TFT_BLACK);
+  display.drawLine(194, 49, 199, 51, TFT_BLACK);
+  display.setTextDatum(top_left);
+  display.setTextColor(TFT_WHITE);
+}
+
+void drawTallyLabels(bool insideOn, bool outsideOn) {
+  auto& display = StickCP2.Display;
+  display.setTextSize(1);
+  display.setTextColor(TFT_WHITE);
+  String outerText = showOwnTally && outsideOn ? outsideSource + ": " + states[outside] : "";
+  String otherOutside = sequence && outsideOn && outside != 3 ? displayText(outsideLive) : "";
+  if (otherOutside.length() && display.textWidth(outerText) > 100)
+    outerText.replace("Tally Arbiter:", "Arbiter:");
+  if (showOwnTally && insideOn) display.drawString(insideSource + ": " + states[inside], 12, 102);
+  if (outerText.length()) display.drawString(outerText, 6, 123);
+  if (lastMinute >= 0) {
+    char timeText[6];
+    snprintf(timeText, sizeof(timeText), "%02d:%02d", lastMinute / 60, lastMinute % 60);
+    display.drawString(timeText, 201, 123);
+  }
+  display.setTextDatum(top_center);
+  if (sequence && insideOn && inside != 3)
+    display.drawString(displayText(insideLive).substring(0, 36), 120, 90);
+  if (otherOutside.length()) {
+    int left = outerText.length() ? 10 + display.textWidth(outerText) : 6;
+    int width = 2 * min(120 - left, lastMinute >= 0 ? 77 : 114);
+    if (display.textWidth(otherOutside) > width) {
+      int separator = otherOutside.indexOf(": ");
+      if (separator >= 0) otherOutside = otherOutside.substring(separator + 2);
+      if (display.textWidth(otherOutside) > width) {
+        while (otherOutside.length() && display.textWidth(otherOutside + "...") > width) {
+          unsigned int end = otherOutside.length() - 1;
+          while (end && (static_cast<uint8_t>(otherOutside[end]) & 0xc0) == 0x80) --end;
+          otherOutside.remove(end);
+        }
+        if (otherOutside.length()) otherOutside += "...";
+      }
+    }
+    if (width > 0) display.drawString(otherOutside, 120, 123);
+  }
+  display.setTextDatum(top_left);
 }
 
 void draw() {
@@ -898,7 +1125,22 @@ void draw() {
   display.setTextDatum(top_left);
   display.setTextSize(1);
   display.startWrite();
-  if (chosenSlot >= 0) {
+  if (modeNotice != ModeNotice::None) {
+    display.fillScreen(TFT_BLACK);
+    display.setTextColor(TFT_WHITE);
+    display.setTextDatum(top_center);
+    const char* title = modeNotice == ModeNotice::Restarting ? "Funkmoduswechsel zu" :
+        modeNotice == ModeNotice::Rollback ? "Funkwechsel fehlgeschlagen" : "Funkmodus gewechselt zu";
+    display.drawString(title, 120, 28);
+    display.setTextColor(TFT_YELLOW);
+    display.setTextSize(2);
+    display.drawString(modeLabel(noticeMode), 120, 57);
+    display.setTextColor(TFT_WHITE);
+    display.setTextSize(1);
+    if (modeNotice == ModeNotice::Restarting) display.drawString("Neustart folgt", 120, 96);
+    if (modeNotice == ModeNotice::Changed && !trialConfig.isEmpty()) display.drawString("Verbindung wird geprueft", 120, 96);
+    if (modeNotice == ModeNotice::Rollback) display.drawString("Vorheriger Funkmodus wieder aktiv", 120, 96);
+  } else if (chosenSlot >= 0) {
     display.fillScreen(TFT_BLACK);
     display.setTextColor(TFT_WHITE);
     display.drawString("Funk- und WLAN-Profil", 5, 12);
@@ -906,7 +1148,7 @@ void draw() {
     if (prefs.begin("tallypilot", true)) {
       JsonDocument selected;
       if (!deserializeJson(selected, prefs.getString(slotKey(chosenSlot).c_str(), ""))) {
-        display.drawString(String(chosenSlot + 1) + "  " + String(selected["mode"] | "udp"), 5, 42);
+        display.drawString(String(chosenSlot + 1) + "  " + modeLabel(selected["mode"] | "udp"), 5, 42);
         display.drawString(displayText(String(selected["ssid"] | "")).substring(0, 36), 5, 59);
       }
       prefs.end();
@@ -940,11 +1182,11 @@ void draw() {
     display.setTextColor(TFT_WHITE);
     display.drawString("TallyPager " TALLY_PAGER_VERSION, 5, 6);
     display.drawString("Stick: " + deviceId, 5, 24);
-    display.drawString(mode == "udp" ? "WLAN: " + WiFi.localIP().toString() : "Funk: " + mode, 5, 42);
+    display.drawString(mode == "udp" ? "WLAN: " + displayedDiagnostics.ip.toString() : "Funk: " + mode, 5, 42);
     display.drawString(mode == "udp" ? "Core: " + core.toString() : "Basis: " + baseMac, 5, 60);
-    display.drawString(rtt < 0 ? "Core RTT: --" : "Core RTT: " + String(rtt) + " ms", 5, 78);
-    display.drawString("RSSI: " + String(WiFi.RSSI()) + " dBm", 5, 96);
-    display.drawString(String("Akku: ") + StickCP2.Power.getBatteryLevel() + "%", 5, 114);
+    display.drawString(displayedDiagnostics.rtt < 0 ? "Core RTT: --" : "Core RTT: " + String(displayedDiagnostics.rtt) + " ms", 5, 78);
+    display.drawString("RSSI: " + String(displayedDiagnostics.rssi) + " dBm", 5, 96);
+    display.drawString(String("Akku: ") + displayedDiagnostics.battery + "%", 5, 114);
   } else {
     const bool showInside = insideSource != "off";
     const bool showOutside = outsideSource != "off";
@@ -953,41 +1195,18 @@ void draw() {
     display.setTextColor(TFT_WHITE);
     String headline = next.isEmpty() ? name : "next: " + displayText(next);
     display.drawString(headline.substring(0, 19), 5, 5);
-    const int bars = qualityBars();
-    const bool delayed = linkDelayed();
-    display.fillRect(127, 0, 113, 18, TFT_BLACK);
-    for (int i = 0; mode == "udp" && i < 4; ++i) {
-      int height = 3 + 2 * i;
-      display.fillRect(128 + i * 5, 14 - height, 3, height, i < bars ? TFT_GREEN : 0x4208);
-    }
-    display.setTextColor(!sequence ? TFT_LIGHTGREY : delayed ? TFT_ORANGE : TFT_WHITE);
-    String connection = !sequence ? "Getrennt" : delayed ? "Delayed" : showReconnectNotice() ? "Verbunden" : "";
-    if (rtt >= 0) {
-      if (!connection.isEmpty()) connection += " ";
-      connection += String(rtt) + "ms";
-    }
-    display.drawString(connection, mode == "udp" ? 148 : 128, 5);
-    display.setTextColor(TFT_WHITE);
-    if (beamerLive && sequence) {
-      display.fillRect(143, 18, 97, 11, TFT_BLACK);
-      display.drawString("LIVE auf BEAMER", 147, 20);
-    }
+    drawLinkStatus(displayedLink);
+    bool beamer = beamerLive && sequence;
+    if (beamer) drawBeamer();
     if (testMode && sequence) {
-      display.fillRect(6, 30, 228, 12, TFT_BLACK);
-      display.drawString("Simulationssignal vom Rechner", 12, 32);
-    }
-    if (showOutside) display.drawString(outsideSource + ": " + states[outside], 12, 93);
-    if (lastMinute >= 0) {
-      char timeText[6];
-      snprintf(timeText, sizeof(timeText), "%02d:%02d", lastMinute / 60, lastMinute % 60);
-      display.drawString(timeText, 201, 123);
-    }
-    if (showInside) display.drawString(insideSource + ": " + states[inside], 12, 83);
-    if (sequence) {
-      display.setTextDatum(top_center);
-      display.drawString(displayText(insideLive).substring(0, 36), 120, 105);
-      display.drawString(displayText(outsideLive).substring(0, 36), 120, 115);
-      display.setTextDatum(top_left);
+      if (beamer) {
+        display.fillRect(6, 21, 120, 22, TFT_BLACK);
+        display.drawString("Simulationssignal", 12, 23);
+        display.drawString("vom Rechner", 12, 33);
+      } else {
+        display.fillRect(6, 30, 228, 12, TFT_BLACK);
+        display.drawString("Simulationssignal vom Rechner", 12, 32);
+      }
     }
     if (!configured || sequence == 0) {
       const char* message = !configured ? "USB-Setup starten" :
@@ -996,7 +1215,7 @@ void draw() {
       display.drawString(message, 12, 38);
     } else {
       display.setTextColor(showInside && inside >= 2 ? TFT_BLACK : TFT_WHITE);
-      int y = testMode || beamerLive ? 46 : 28;
+      int y = beamer ? 58 : testMode ? 46 : 28;
       if (textMode != 0) {
         int tally = textMode == 1 ? (showOutside ? outside : inside) : (showInside ? inside : outside);
         display.fillRect(8, y, 224, 30, TFT_BLACK);
@@ -1008,21 +1227,22 @@ void draw() {
       } else {
         display.setTextSize(2);
         String text = displayText(cue);
-        unsigned int lines = y == 28 ? 3 : 2;
+        unsigned int lines = (88 - y) / 17;
         unsigned int columns = 17, lineHeight = 17;
         if (text.length() > columns * lines) {
           display.setTextSize(1);
           columns = 36;
           lineHeight = 9;
-          lines = (80 - y) / lineHeight;
+          lines = (88 - y) / lineHeight;
         }
         for (unsigned int i = 0; i < min(text.length(), columns * lines); i += columns)
           display.drawString(text.substring(i, i + columns), 12, y + (i / columns) * lineHeight);
       }
       display.setTextSize(1);
       if (textMode == 0 && requireAck && !chatId.isEmpty()) {
+        display.setTextColor(TFT_WHITE);
         display.drawString(confirmedAck == chatId ? "Quittiert" :
-            pendingAck == chatId ? "Warte auf PC" : "B: quittieren", 12, 125);
+            pendingAck == chatId ? "Warte auf PC" : "B: quittieren", 149, 102);
       }
       if (textMode == 0 && shownId != chatId) {
         shownId = chatId;
@@ -1030,6 +1250,7 @@ void draw() {
           send("TP1|chat_rcpt|" + deviceId + "|" + session + "|" + chatId + "|shown");
       }
     }
+    drawTallyLabels(showInside, showOutside);
   }
   display.endWrite();
 }
@@ -1040,7 +1261,6 @@ void setup() {
   Serial.begin(115200);
   StickCP2.begin(M5.config());
   StickCP2.Display.setRotation(1);
-  StickCP2.Display.setBrightness(160);
   const uint64_t mac = ESP.getEfuseMac();
   char id[13];
   snprintf(id, sizeof(id), "%012llx", static_cast<unsigned long long>(mac));
@@ -1051,14 +1271,29 @@ void setup() {
   name = "TallyPager";
   Preferences prefs;
   if (prefs.begin("tallypilot", false)) {
+    if (prefs.isKey("displayPower")) {
+      uint16_t power = prefs.getUShort("displayPower", defaultBrightness);
+      uint8_t level = power & 0xff, flags = power >> 8;
+      if (level >= 10 && level <= 100 && flags <= 3) {
+        brightness = level;
+        dimFlags = flags;
+      }
+    }
     String json = prefs.getString("config", "");
     String base = prefs.getString("base", "");
     JsonDocument doc;
     configured = !deserializeJson(doc, json) && settings(doc, false);
     if (base.length() && !deserializeJson(doc, base)) baseConfig(doc, false);
+    if (prefs.isKey("radioNotice")) {
+      String notice = prefs.getString("radioNotice", "");
+      prefs.remove("radioNotice");
+      if (notice == "rollback") showModeNotice(ModeNotice::Rollback, mode);
+      else if (notice == mode) showModeNotice(ModeNotice::Changed, mode);
+    }
     if (configured && !baseRole) loadSlotTrial(prefs, doc);
     prefs.end();
   }
+  updateBrightness(millis());
   if (baseRole || (configured && mode != "udp")) {
     radio::start(mode, radioChannel, baseRole, gatewayAddress);
   } else if (configured) {
@@ -1080,6 +1315,7 @@ void setup() {
     WiFi.setAutoReconnect(true);
     connectWifi();
   }
+  if (modeNotice != ModeNotice::None) modeNoticeUntil = millis() + 2600;
   status();
 }
 
@@ -1119,9 +1355,14 @@ bool profileButtons(uint32_t now) {
       if (M5.BtnB.wasClicked()) {
         String candidate = prefs.getString(slotKey(chosenSlot).c_str(), "");
         JsonDocument doc;
+        String target;
         if (!deserializeJson(doc, candidate) && settings(doc, false, false) &&
-            prefs.putString("config", candidate) == candidate.length()) restartAt = now + 150;
+            prefs.putString("config", candidate) == candidate.length()) target = doc["mode"] | "udp";
         chosenSlot = -1;
+        prefs.end();
+        if (target.length()) restartForMode(target, now, true);
+        dirty = true;
+        return true;
       } else {
         for (int offset = 1; offset <= 4; ++offset) {
           int nextSlot = (chosenSlot + offset) % 4;
@@ -1155,13 +1396,19 @@ void loop() {
     manageWifi(now);
     updateConfig(now);
   }
+  if (M5.BtnA.isPressed() || M5.BtnB.isPressed()) displayActivityAt = now;
   bool handlingProfile = profileButtons(now);
+  if (modeNotice != ModeNotice::None && static_cast<int32_t>(now - modeNoticeUntil) >= 0) {
+    modeNotice = ModeNotice::None;
+    dirty = true;
+  }
   if (presentationAt && now - presentationAt >= 1500) {
     presentationAt = 0;
     textMode = 0;
     beamerLive = false;
     insideLive = outsideLive = "";
     dirty = true;
+    displayActivityAt = now;
   }
   if (!handlingProfile && M5.BtnA.wasClicked()) {
     diagnostics = !diagnostics;
@@ -1173,26 +1420,48 @@ void loop() {
     send("TP1|chat_rcpt|" + deviceId + "|" + session + "|" + chatId + "|ack");
     dirty = true;
   }
-  int minute = clockSynced ? (clockSeconds + (now - clockAt) / 1000) % 86400 / 60 : -1;
-  if (minute != lastMinute) { lastMinute = minute; dirty = true; }
   if (baseRole && baseCount && now - baseViewAt >= 3500) { baseCount = 0; dirty = true; }
-  if (now - lastLinkCheck >= 200) {
+  bool unobstructed = modeNotice == ModeNotice::None && chosenSlot < 0;
+  bool normalView = unobstructed && !baseRole && !diagnostics;
+  int minute = clockSynced ? (clockSeconds + (now - clockAt) / 1000) % 86400 / 60 : -1;
+  if (minute != lastMinute) { lastMinute = minute; dirty |= normalView; }
+  bool linkChanged = false;
+  if (!baseRole && (dirty || now - lastLinkCheck >= 200)) {
     lastLinkCheck = now;
-    static int previousBars = -2;
-    static bool previousDelay = false;
-    static bool previousNotice = false;
-    int bars = qualityBars();
-    bool delayed = linkDelayed();
-    bool notice = showReconnectNotice();
-    dirty |= bars != previousBars || delayed != previousDelay || notice != previousNotice;
-    previousBars = bars;
-    previousDelay = delayed;
-    previousNotice = notice;
+    LinkDisplay current;
+    current.bars = qualityBars();
+    current.rtt = rtt;
+    current.online = sequence != 0;
+    current.delayed = linkDelayed();
+    current.notice = !current.delayed && showReconnectNotice();
+    if (current.online != displayedLink.online || current.delayed != displayedLink.delayed)
+      displayActivityAt = now;
+    // Before Tally is established, joining Wi-Fi also changes the offline message.
+    dirty |= normalView && !current.online && (current.bars < 0) != (displayedLink.bars < 0);
+    linkChanged = current.bars != displayedLink.bars || current.rtt != displayedLink.rtt ||
+        current.online != displayedLink.online || current.delayed != displayedLink.delayed ||
+        current.notice != displayedLink.notice;
+    displayedLink = current;
   }
-  if (dirty || (diagnostics && now - lastDraw >= 1000)) {
+  if (!baseRole && unobstructed && diagnostics && (dirty || now - lastDiagnosticCheck >= 1000)) {
+    lastDiagnosticCheck = now;
+    DiagnosticDisplay current;
+    if (mode == "udp") current.ip = WiFi.localIP();
+    current.rtt = rtt;
+    current.rssi = WiFi.RSSI();
+    current.battery = StickCP2.Power.getBatteryLevel();
+    dirty |= current.ip != displayedDiagnostics.ip || current.rtt != displayedDiagnostics.rtt ||
+        current.rssi != displayedDiagnostics.rssi || current.battery != displayedDiagnostics.battery;
+    displayedDiagnostics = current;
+  }
+  updateBrightness(now);
+  if (dirty) {
     draw();
-    lastDraw = now;
     dirty = false;
+  } else if (normalView && linkChanged) {
+    StickCP2.Display.startWrite();
+    drawLinkStatus(displayedLink);
+    StickCP2.Display.endWrite();
   }
   delay(1);
 }

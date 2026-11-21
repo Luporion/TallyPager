@@ -4,7 +4,7 @@ internal sealed partial class MainWindow
 {
     private readonly TableLayoutPanel manualTable = new()
     {
-        AutoSize = true, Dock = DockStyle.Top, ColumnCount = 6, RowCount = 1, Margin = new Padding(0)
+        AutoSize = true, Dock = DockStyle.Top, ColumnCount = 7, RowCount = 1, Margin = new Padding(0)
     };
     private readonly CheckBox allManual = new()
     {
@@ -13,7 +13,7 @@ internal sealed partial class MainWindow
     private readonly Dictionary<string, ManualRow> manualRows = [];
     private bool refreshingManual;
     private sealed record ManualRow(Label Name, CheckBox Atem, CheckBox Vmix, Button[] AtemStates,
-        Button[] VmixStates, Button[] BeamerStates, ComboBox Display, CheckBox Live);
+        Button[] VmixStates, Button[] BeamerStates, ComboBox Display, CheckBox Live, CheckBox OwnTally);
 
     private void AddManualTally(TableLayoutPanel parent)
     {
@@ -30,9 +30,9 @@ internal sealed partial class MainWindow
             Text = "„Manuell“ ersetzt die jeweilige Mixerquelle für diesen Stick. Beamer wird direkt geschaltet. " +
                 "Innen/Außen folgen der Quellenzuordnung. Displayfunktionen benötigen Firmware 0.9.0. Simulationen haben Vorrang."
         });
-        foreach (int width in new[] { 105, 205, 205, 112, 128, 88 })
+        foreach (int width in new[] { 105, 205, 205, 112, 128, 88, 108 })
             manualTable.ColumnStyles.Add(new(SizeType.Absolute, width));
-        string[] headers = ["TallyPager", "ATEM", "vMix", "Beamer", "Großer Text", "Live-Inputs"];
+        string[] headers = ["TallyPager", "ATEM", "vMix", "Beamer", "Großer Text", "Live-Inputs", "Eigener Tally"];
         manualTable.RowStyles.Add(new(SizeType.AutoSize));
         for (int i = 0; i < headers.Length; i++)
             manualTable.Controls.Add(new Label { Text = headers[i], AutoSize = true, Font = new Font(Font, FontStyle.Bold) }, i, 0);
@@ -86,11 +86,13 @@ internal sealed partial class MainWindow
                     display.SelectedIndexChanged += (_, _) => Change(current => current with { TextMode = display.SelectedIndex });
                     var live = new CheckBox { Text = "Anzeigen", AutoSize = true };
                     live.CheckedChanged += (_, _) => Change(current => current with { ShowLive = live.Checked });
+                    var ownTally = new CheckBox { Text = "Anzeigen", AutoSize = true, AccessibleName = "Eigene Tally-Texte anzeigen" };
+                    ownTally.CheckedChanged += (_, _) => Change(current => current with { ShowOwnTally = ownTally.Checked });
                     int index = manualTable.RowCount++;
                     manualTable.RowStyles.Add(new(SizeType.AutoSize));
-                    Control[] cells = [name, MixerCell(a, ab), MixerCell(v, vb), InlineButtons(bb), display, live];
+                    Control[] cells = [name, MixerCell(a, ab), MixerCell(v, vb), InlineButtons(bb), display, live, ownTally];
                     for (int i = 0; i < cells.Length; i++) manualTable.Controls.Add(cells[i], i, index);
-                    row = new(name, a, v, ab, vb, bb, display, live);
+                    row = new(name, a, v, ab, vb, bb, display, live, ownTally);
                     manualRows.Add(id, row);
                 }
                 var value = session.Control(pager.Id);
@@ -112,6 +114,8 @@ internal sealed partial class MainWindow
                 row.Display.Enabled = row.Live.Enabled = presentation;
                 row.Display.SelectedIndex = value.TextMode;
                 row.Live.Checked = value.ShowLive;
+                row.OwnTally.Enabled = pager.Firmware?.Supports(FirmwareInfo.TallyLabels) == true;
+                row.OwnTally.Checked = !row.OwnTally.Enabled || value.ShowOwnTally;
             }
             var settings = statuses.Select(pager => session.Control(pager.Id)).ToArray();
             allManual.CheckState = settings.Length > 0 && settings.All(value => value.ManualAtem && value.ManualVmix)

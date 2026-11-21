@@ -84,6 +84,7 @@ internal sealed partial class MainWindow : Form
     private readonly TabPage setup = new("Stick einrichten/verwalten");
     private readonly Label selectedFirmware = Notice();
     private readonly PagerPreview pagerPreview = new();
+    private readonly Button displayPower = Action("Display und Akku …");
     private readonly System.Windows.Forms.Timer timer = new() { Interval = 25 };
     private AtemSource? atem;
     private VmixSource? vmix;
@@ -139,7 +140,8 @@ internal sealed partial class MainWindow : Form
         selectedFirmware.MaximumSize = new Size(800, 0);
         selectedFirmware.Margin = new Padding(3, 3, 3, 7);
         deviceActions.Controls.Add(selectedFirmware, 0, 0);
-        deviceActions.Controls.Add(Action("Funkmodus wechseln …", (_, _) => OpenRemoteModes()), 1, 0);
+        displayPower.Click += (_, _) => OpenDisplayPower();
+        deviceActions.Controls.Add(InlineButtons(displayPower, Action("Funkmodus wechseln …", (_, _) => OpenRemoteModes())), 1, 0);
         layout.Controls.Add(deviceActions, 0, 2);
         layout.Controls.Add(tabs, 0, 3);
         layout.Controls.Add(NetworkFooter(), 0, 4);
@@ -771,6 +773,7 @@ internal sealed partial class MainWindow : Form
     {
         var status = SelectedIds() is [var id] ? core.Statuses().FirstOrDefault(pager => pager.Id == id) : null;
         pagerPreview.Update(status);
+        displayPower.Enabled = status is not null;
         string text = status is null ? "" : status.Firmware is { } firmware
             ? (status.Online || status.Settings is not null ? "" : "Zuletzt erkannt · ") + firmware.Description
             : "Firmware noch nicht gemeldet. Die genaue Version lässt sich per USB ablesen.";
