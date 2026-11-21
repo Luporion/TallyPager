@@ -82,6 +82,7 @@ internal sealed partial class MainWindow : Form
     private readonly TabPage sources = new("Externe Verbindungen");
     private readonly TabPage simulation = new("Simulation");
     private readonly TabPage setup = new("Stick einrichten/verwalten");
+    private readonly ComboBox setupMethod = Choices();
     private readonly Label selectedFirmware = Notice();
     private readonly PagerPreview pagerPreview = new();
     private readonly Button displayPower = Action("Display und Akku …");
@@ -279,7 +280,7 @@ internal sealed partial class MainWindow : Form
         page.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         setup.Controls.Add(page);
         var header = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, Padding = new Padding(20, 9, 0, 0) };
-        var method = Choices();
+        var method = setupMethod;
         method.AccessibleName = "Verbindungsart";
         method.Width = 175;
         method.Items.AddRange(["USB", "WLAN"]);
@@ -764,7 +765,7 @@ internal sealed partial class MainWindow : Form
             row.Cells["Firmware"].ToolTipText = status.Firmware?.Description ?? "Firmware noch nicht gemeldet.";
             row.Cells["Adresse"].Style.ForeColor = status.LastKnownAddress ? Color.DimGray : devices.ForeColor;
             row.Cells["Adresse"].ToolTipText = status.LastKnownAddress ? "Zuletzt gemeldete Adresse" :
-                status.Transport == "udp" ? "IPv4-Adresse des Sticks" : "Funkadresse des Sticks";
+                Transport.PagerMode(status.Transport) == "udp" ? "IPv4-Adresse des Sticks" : "Funkadresse des Sticks";
         }
         ShowSelectedFirmware();
     }

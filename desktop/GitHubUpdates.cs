@@ -26,6 +26,7 @@ internal sealed class GitHubUpdates(HttpClient client)
         { Timeout = TimeSpan.FromMinutes(3) };
 
     public static string FirmwareName(Version version) => $"TallyPager-Firmware-M5StickC-Plus2-{version}.zip";
+    public static string HotspotFirmwareName(Version version) => $"TallyPager-Firmware-WLAN-Bruecke-M5StickC-Plus2-{version}.zip";
 
     internal static Version ReleaseVersion(GitHubRelease release)
     {
@@ -59,14 +60,21 @@ internal sealed class GitHubUpdates(HttpClient client)
         if (version < Version.Parse(PagerUsb.Version))
             throw new InvalidOperationException("Das GitHub-Release ist älter als das gestartete Programm.");
         string firmwareName = FirmwareName(version);
-        string baseName = $"TallyPager-Firmware-ESP8266-{version}.zip";
         var exe = RequireAsset(release, ExeName, 250_000_000);
         var firmware = RequireAsset(release, firmwareName, 15_000_000);
-        var baseFirmware = (release.Assets ?? []).Any(item => item?.Name == baseName)
-            ? RequireAsset(release, baseName, 2_000_000) : null;
         string exeHash = await ExpectedHash(release, exe, cancel);
         string firmwareHash = await ExpectedHash(release, firmware, cancel);
-        string? baseHash = baseFirmware is null ? null : await ExpectedHash(release, baseFirmware, cancel);
+        var extras = new List<(GitHubAsset Asset, string Hash, FirmwareTarget Target, string Label)>();
+        foreach (var (name, target, maximum, label) in new[]
+        {
+            ($"TallyPager-Firmware-ESP8266-{version}.zip", FirmwareTarget.Esp8266, 2_000_000, "ESP8266-Firmware"),
+            (HotspotFirmwareName(version), FirmwareTarget.Hotspot, 15_000_000, "WLAN-Brücken-Firmware")
+        })
+        {
+            if (!(release.Assets ?? []).Any(item => item?.Name == name)) continue;
+            var asset = RequireAsset(release, name, maximum);
+            extras.Add((asset, await ExpectedHash(release, asset, cancel), target, label));
+        }
         string destination = Path.Combine(root, version.ToString());
         if (Directory.Exists(destination))
         {
@@ -91,10 +99,10 @@ internal sealed class GitHubUpdates(HttpClient client)
             await DownloadFile(release.Tag, exe, exeHash, executable, cancel);
             progress.Report("Stick-Firmware wird geladen …");
             await DownloadFile(release.Tag, firmware, firmwareHash, package, cancel);
-            if (baseFirmware is not null)
+            foreach (var extra in extras)
             {
-                progress.Report("ESP8266-Firmware wird geladen …");
-                await DownloadFile(release.Tag, baseFirmware, baseHash!, Path.Combine(staging, baseName), cancel);
+                progress.Report(extra.Label + " wird geladen …");
+                await DownloadFile(release.Tag, extra.Asset, extra.Hash, Path.Combine(staging, extra.Asset.Name), cancel);
             }
             progress.Report("Versionen und Prüfsummen werden geprüft …");
             VerifyPair(staging);
@@ -108,7 +116,7 @@ internal sealed class GitHubUpdates(HttpClient client)
             {
                 File.Delete(Path.Combine(staging, ExeName));
                 File.Delete(Path.Combine(staging, firmwareName));
-                File.Delete(Path.Combine(staging, baseName));
+                foreach (var extra in extras) File.Delete(Path.Combine(staging, extra.Asset.Name));
                 Directory.Delete(staging);
             }
         }
@@ -117,7 +125,7 @@ internal sealed class GitHubUpdates(HttpClient client)
         {
             if (!HashMatches(Path.Combine(directory, ExeName), exeHash) ||
                 !HashMatches(Path.Combine(directory, firmwareName), firmwareHash) ||
-                (baseHash is not null && !HashMatches(Path.Combine(directory, baseName), baseHash))) return false;
+                extras.Any(extra => !HashMatches(Path.Combine(directory, extra.Asset.Name), extra.Hash))) return false;
             VerifyPair(directory);
             return true;
         }
@@ -126,8 +134,8 @@ internal sealed class GitHubUpdates(HttpClient client)
             if (!ExecutableHasVersion(Path.Combine(directory, ExeName), version))
                 throw new InvalidDataException("Die EXE enthält eine andere Produktversion als das GitHub-Release.");
             PagerUsb.LoadFirmware(Path.Combine(directory, firmwareName), null, version.ToString());
-            if (baseFirmware is not null)
-                PagerUsb.LoadFirmware(Path.Combine(directory, baseName), null, version.ToString(), esp8266: true);
+            foreach (var extra in extras)
+                PagerUsb.LoadFirmware(Path.Combine(directory, extra.Asset.Name), null, version.ToString(), extra.Target);
         }
         InstalledUpdate Installed(string directory) =>
             new(Path.Combine(directory, ExeName), Path.Combine(directory, firmwareName), exeHash);

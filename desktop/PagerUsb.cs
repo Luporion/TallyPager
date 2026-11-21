@@ -11,24 +11,28 @@ namespace TallyPager;
 internal sealed record UsbStatus(string Version, string Id, bool Configured, bool Wifi, string Ip,
     bool Core, int Inside, int Outside, string Cue, string Next, string Mode = "udp",
     bool BaseRole = false, string RadioAddress = "", int Channel = 6, bool RadioReady = false,
-    string[]? Features = null, int Slot = 0, string Board = "m5stick-cplus2")
+    string[]? Features = null, int Slot = 0, string Board = "m5stick-cplus2",
+    string HotspotSsid = "", string HotspotPassword = "")
 {
     public FirmwareInfo? Firmware => FirmwareInfo.Read(Version, Features);
     public string BoardName => Board switch
     {
-        "m5stick-cplus2" => "M5StickC Plus2",
+        "m5stick-cplus2" => Mode == Transport.Hotspot ? "M5StickC Plus2 · WLAN-Brücke" : "M5StickC Plus2",
         "esp8266" => "ESP8266MOD · Funkbasis ohne Display",
         _ => $"Anderes Gerät ({Board})"
     };
 }
 internal sealed record UsbSettings(string Id, string Name, string Host, string Ssid, string Password,
     string Mode, string Gateway, int Channel, int Slot);
+internal enum FirmwareTarget { Pager, Esp8266, Hotspot }
 
 internal static class PagerUsb
 {
-    public const string Version = "0.10.2";
+    public const string Version = "0.11.0";
     public const string FirmwareFileName = "TallyPager-Firmware-M5StickC-Plus2-" + Version + ".zip";
     public const string Esp8266FirmwareFileName = "TallyPager-Firmware-ESP8266-" + Version + ".zip";
+    public const string HotspotFirmwareFileName = "TallyPager-Firmware-WLAN-Bruecke-M5StickC-Plus2-" + Version + ".zip";
+    private const int StandardBaud = 115200, HotspotBaud = 460800;
     private const string StatusPrefix = "TP ";
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
 
@@ -43,13 +47,15 @@ internal static class PagerUsb
         var timer = Stopwatch.StartNew();
         while (timer.Elapsed < timeout)
         {
-            serial.WriteLine("TP STATUS");
+            serial.WriteLine("\nTP STATUS");
             var reply = ReadReply(serial, TimeSpan.FromMilliseconds(420), "TP {");
             if (reply?.StartsWith("TP {", StringComparison.Ordinal) == true)
             {
                 if (ParseStatus(reply) is { } status) return status;
             }
             Thread.Sleep(120);
+            serial.BaudRate = serial.BaudRate == StandardBaud ? HotspotBaud : StandardBaud;
+            serial.DiscardInBuffer();
         }
         throw new TimeoutException("Die TallyPager-Firmware antwortet nicht am ausgewählten USB-Port.");
     }
@@ -127,6 +133,14 @@ internal static class PagerUsb
         SetRole(port, id, status => status.Board == "m5stick-cplus2" && status.BaseRole && status.Firmware?.Supports(FirmwareInfo.RadioBase) == true,
             "TP PAGER", status => status.Configured && !status.BaseRole);
 
+    public static UsbStatus ConfigureHotspotChannel(string port, string id, int channel)
+    {
+        if (channel is not (1 or 6 or 11)) throw new ArgumentOutOfRangeException(nameof(channel));
+        return SetRole(port, id, status => status.Mode == Transport.Hotspot && status.Firmware?.AllowsBase(Transport.Hotspot) == true,
+            FormattableString.Invariant($"TP AP {channel}"),
+            status => status.Mode == Transport.Hotspot && status.RadioReady && status.Channel == channel);
+    }
+
     private static UsbStatus SetRole(string port, string id, Func<UsbStatus, bool> supports, string command, Func<UsbStatus, bool> ready)
     {
         using (var serial = Open(port))
@@ -152,12 +166,13 @@ internal static class PagerUsb
     private static readonly (string Offset, string Name, long Limit)[] Esp8266Images =
         [("0x0", "firmware.bin", 0xff000)];
 
-    public static async Task Flash(string port, string package, IProgress<string> progress, bool esp8266 = false)
+    public static async Task Flash(string port, string package, IProgress<string> progress, FirmwareTarget target = FirmwareTarget.Pager)
     {
-        string directory = Path.Combine(PilotCore.DataDirectory, "bundle", Version, esp8266 ? "esp8266" : "m5stick-cplus2");
+        bool esp8266 = target == FirmwareTarget.Esp8266;
+        string directory = Path.Combine(PilotCore.DataDirectory, "bundle", Version, FirmwareBoard(target));
         Directory.CreateDirectory(directory);
         WriteVerifiedResource(directory, "esptool.exe");
-        LoadFirmware(package, directory, esp8266: esp8266);
+        LoadFirmware(package, directory, target: target);
         var start = Flasher(directory);
         string[] common = ["--chip", esp8266 ? "esp8266" : "esp32", "--port", port];
         bool correctChip = false;
@@ -207,7 +222,14 @@ internal static class PagerUsb
         RedirectStandardOutput = true, RedirectStandardError = true
     };
 
-    internal static void LoadFirmware(string path, string? directory, string expectedVersion = Version, bool esp8266 = false)
+    private static string FirmwareBoard(FirmwareTarget target) => target switch
+    {
+        FirmwareTarget.Hotspot => "m5stick-cplus2-hotspot",
+        FirmwareTarget.Esp8266 => "esp8266",
+        _ => "m5stick-cplus2"
+    };
+
+    internal static void LoadFirmware(string path, string? directory, string expectedVersion = Version, FirmwareTarget target = FirmwareTarget.Pager)
     {
         using var zip = ZipFile.OpenRead(path);
         var manifestEntry = zip.GetEntry("manifest.json");
@@ -215,10 +237,18 @@ internal static class PagerUsb
             throw new InvalidDataException("Im Firmwarepaket fehlt das Manifest.");
         using var manifestStream = manifestEntry.Open();
         var manifest = JsonSerializer.Deserialize<FirmwareManifest>(manifestStream, Json);
-        if (manifest?.Sha256 is null || manifest.Board != (esp8266 ? "esp8266" : "m5stick-cplus2") || manifest.Version != expectedVersion)
-            throw new InvalidDataException($"Bitte das Firmwarepaket für {(esp8266 ? "ESP8266" : "M5StickC Plus2")} und TallyPager {expectedVersion} auswählen.");
+        if (manifest?.Sha256 is null || manifest.Board != FirmwareBoard(target) || manifest.Version != expectedVersion)
+        {
+            string purpose = target switch
+            {
+                FirmwareTarget.Hotspot => "die WLAN-Brücke (M5StickC Plus2)",
+                FirmwareTarget.Esp8266 => "die ESP8266-Funkbasis",
+                _ => "den M5StickC Plus2 als Pager oder Funkbasis"
+            };
+            throw new InvalidDataException($"Bitte das Firmwarepaket für {purpose} in Version {expectedVersion} auswählen.");
+        }
 
-        foreach (var image in esp8266 ? Esp8266Images : Images)
+        foreach (var image in target == FirmwareTarget.Esp8266 ? Esp8266Images : Images)
         {
             var entry = zip.GetEntry(image.Name);
             if (entry is null || entry.Length < 1 || entry.Length > image.Limit ||
@@ -293,7 +323,7 @@ internal static class PagerUsb
 
     internal static SerialPort Open(string port)
     {
-        var serial = new SerialPort(port, 115200) { Encoding = Encoding.UTF8, ReadTimeout = 150, WriteTimeout = 1000 };
+        var serial = new SerialPort(port, StandardBaud) { Encoding = Encoding.UTF8, ReadTimeout = 150, WriteTimeout = 1000 };
         try
         {
             serial.Open();

@@ -46,7 +46,7 @@ internal static class RegieCheck
                 checks.Add(new(CheckResult.Problem, role.Name, "Der Rolle ist kein gepaarter Stick zugewiesen."));
                 continue;
             }
-            if (Transport.IsRadio(pager.Transport)) expectedRadio.Add(pager.Transport);
+            if (Transport.IsRadio(pager.Transport) || pager.Transport == Transport.Hotspot) expectedRadio.Add(pager.Transport);
             var result = pager.Connection switch
             {
                 Connection.Connected => CheckResult.Ready,

@@ -57,6 +57,7 @@ internal sealed partial class MainWindow
         {
             baseFirmware.Text = "";
             ShowBaseModes(null);
+            ShowHotspot(null);
         };
         Full(setupBase, Buttons(Action("Firmware lesen", async (_, _) => await InspectUsb(basePort, baseFirmware))));
         Full(setupBase, baseFirmware);
@@ -69,6 +70,7 @@ internal sealed partial class MainWindow
         Full(setupBase, Buttons(Action("Funkbasis einrichten", async (_, _) => await ConfigureBase(false)),
             baseLink, restorePager));
         Full(setupBase, baseStatus);
+        AddHotspotSetup(setupBase);
         Heading(setupBase, "ESP8266-Funkbasis");
         Full(setupBase, Buttons(Action("ESP8266-Firmware flashen", async (_, _) => await FlashEsp8266())));
         Full(setupBase, new Label
@@ -102,7 +104,7 @@ internal sealed partial class MainWindow
         {
             int channel = (int)baseChannel.Value;
             baseStatus.Text = "ESP8266 und Flashgröße werden geprüft …";
-            await PagerUsb.Flash(port, package, new Progress<string>(value => baseStatus.Text = value), esp8266: true);
+            await PagerUsb.Flash(port, package, new Progress<string>(value => baseStatus.Text = value), FirmwareTarget.Esp8266);
             var status = await Task.Run(() => PagerUsb.ReadStatus(port, TimeSpan.FromSeconds(8)));
             if (status.Board != "esp8266" || status.Version != PagerUsb.Version || !RadioBridge.CanConnect(status))
                 throw new InvalidOperationException("Die ESP8266-Funkbasis hat den Neustart nicht bestätigt.");
@@ -157,11 +159,15 @@ internal sealed partial class MainWindow
         core.ObserveUsbFirmware(status.Id, status.Firmware);
         var info = status.Firmware;
         label.Text = status.BoardName + " · " + (info?.Description ?? "Unbekannte Firmware.");
-        if (status.Board != "m5stick-cplus2" && info is { Available.Length: > 0 })
+        if ((status.Board != "m5stick-cplus2" || status.Mode == Transport.Hotspot) && info is { Available.Length: > 0 })
             label.Text = $"{status.BoardName} · Firmware {info.ShortVersion}\nUnterstützt · {string.Join(", ", info.Available)}";
         if (status.Board != "m5stick-cplus2" && info is { Unknown.Length: > 0 })
             label.Text += "\nGemeldete Funktionen · " + string.Join(", ", info.Unknown);
-        if (label == baseFirmware) ShowBaseModes(status);
+        if (label == baseFirmware)
+        {
+            ShowBaseModes(status);
+            ShowHotspot(status);
+        }
         if (status.Firmware is { Older: true })
             label.Text += "\nFirmware-Update kann separat gestartet werden.";
     }
@@ -189,7 +195,7 @@ internal sealed partial class MainWindow
             return activeRadio.Status;
         }
         var status = await Task.Run(() => PagerUsb.ReadStatus(port, TimeSpan.FromSeconds(4)));
-        ShowUsbFirmware(status, label);
+        if (label != baseFirmware || Equals(basePort.SelectedItem, port)) ShowUsbFirmware(status, label);
         return status;
     }
 
@@ -240,7 +246,7 @@ internal sealed partial class MainWindow
             var progress = new Progress<string>(value => usbStatus.Text = value);
             await Task.Run(() => PagerUsb.Flash(port, package, progress));
             var result = await Task.Run(() => PagerUsb.ReadStatus(port, TimeSpan.FromSeconds(8)));
-            if (result.Version != PagerUsb.Version)
+            if (result.Version != PagerUsb.Version || result.Mode == Transport.Hotspot)
                 throw new InvalidOperationException("Firmwareversion nach Neustart nicht bestätigt.");
             ShowUsbFirmware(result, usbFirmware);
             usbStatus.Text = $"Firmware {result.Version} installiert.";
@@ -255,6 +261,7 @@ internal sealed partial class MainWindow
         if (activeRadio is not null) { DisconnectBase("Funkbasis getrennt."); return; }
         if (basePort.SelectedItem is not string port) { baseStatus.Text = "USB-Port der Funkbasis auswählen."; return; }
         busy = true;
+        basePort.Enabled = false;
         try
         {
             baseStatus.Text = "Funkbasis wird geprüft …";
@@ -270,13 +277,14 @@ internal sealed partial class MainWindow
             baseLink!.Text = "Funkbasis trennen";
             var baseInfo = activeRadio.Status;
             ShowUsbFirmware(baseInfo, baseFirmware);
-            baseStatus.Text = $"{port} · {Transport.Name(baseInfo.Mode)} · Adresse {baseInfo.RadioAddress}" +
+            baseStatus.Text = baseInfo.Mode == Transport.Hotspot ? $"{port} · WLAN-Brücke verbunden · {baseInfo.HotspotSsid}" :
+                $"{port} · {Transport.Name(baseInfo.Mode)} · Adresse {baseInfo.RadioAddress}" +
                 (IsEspNow(baseInfo.Mode) ? $" · Kanal {baseInfo.Channel}" : "");
             core.Diagnostics.Add("USB-Funkbasis", "Basis verbunden", Transport.Name(baseInfo.Mode));
             UpdateProvisionFields();
         }
         catch (Exception error) { baseStatus.Text = error.Message; }
-        finally { busy = false; }
+        finally { basePort.Enabled = true; busy = false; }
     }
 
     private void DisconnectBase(string notice)

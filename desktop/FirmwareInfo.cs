@@ -18,6 +18,7 @@ internal sealed class FirmwareInfo
         [Wifi] = "WLAN-Einstellungen",
         ["wifi-discovery"] = "WLAN-Suche",
         [RadioBase] = "Funkbasis",
+        [Transport.Hotspot] = "WLAN-Brücke per USB",
         ["espnow"] = "ESP-NOW",
         ["espnow-lr"] = "ESP-NOW LR",
         ["ble"] = "BLE",
@@ -76,13 +77,15 @@ internal sealed class FirmwareInfo
     public static FirmwareInfo LegacyRadio { get; } = new("0.6.0", new(0, 6, 0), false, false, null);
     public bool Supports(string feature) => features?.Contains(feature, StringComparer.Ordinal) == true;
     public bool AllowsUsbMode(string mode) => Supports(Usb) && (mode == "udp" || Supports(mode));
-    public bool AllowsBase(string mode) => Transport.IsRadio(mode) && Supports(RadioBase) && Supports(mode);
+    public bool AllowsBase(string mode) => mode == Transport.Hotspot ? Supports(Transport.Hotspot) :
+        Transport.IsRadio(mode) && Supports(RadioBase) && Supports(mode);
     public bool Older => ExactVersion && VersionNumber < Ui;
     public bool Newer => ExactVersion && VersionNumber > Ui;
     public string ShortVersion => !ExactVersion ? $"≥ {VersionText}" :
         Older ? VersionText + " · älter" : Newer ? VersionText + " · neuer" : VersionText;
 
-    public string[] Missing => features is null ? [] : Known.Where(pair => !Supports(pair.Key)).Select(pair => pair.Value).ToArray();
+    public string[] Missing => features is null ? [] : Known.Where(pair => pair.Key != Transport.Hotspot && !Supports(pair.Key))
+        .Select(pair => pair.Value).ToArray();
     public string[] Available => features is null ? [] : Known.Where(pair => Supports(pair.Key)).Select(pair => pair.Value).ToArray();
     public string[] Unknown => features is null ? [] : features.Where(id => !Known.ContainsKey(id)).ToArray();
 

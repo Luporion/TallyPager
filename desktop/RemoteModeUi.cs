@@ -110,7 +110,7 @@ internal sealed partial class MainWindow
         var skipped = new List<string>();
         foreach (var pager in core.Statuses())
         {
-            if (pager.Online && pager.Transport == mode) continue;
+            if (pager.Online && Transport.PagerMode(pager.Transport) == mode) continue;
             var profiles = pager.Slots?.Where(slot => slot.Mode == mode && slot.Number != pager.ActiveSlot).ToArray();
             if (!pager.Online || profiles is not [var profile] || pager.Firmware?.Supports(FirmwareInfo.RemoteSlots) != true)
             {

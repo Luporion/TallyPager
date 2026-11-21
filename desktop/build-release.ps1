@@ -5,11 +5,10 @@ $env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'
 $project = Split-Path -Parent $PSScriptRoot
 $firmwareProject = Join-Path $project 'CameraCue'
 $firmwareBuild = Join-Path $firmwareProject '.pio/pilot-build'
-$firmware = Join-Path $firmwareBuild 'tallypager-pilot'
 $bundle = Join-Path $PSScriptRoot 'obj/bundle'
 $firmwarePackage = Join-Path $PSScriptRoot 'obj/firmware-package'
 $tools = Join-Path $PSScriptRoot 'obj/esptool'
-$version = '0.10.2'
+$version = '0.11.0'
 $output = Join-Path $project "dist/$version"
 $zip = Join-Path $tools 'esptool-v5.1.0-windows-amd64.zip'
 $platformHome = if ($env:PLATFORMIO_CORE_DIR) { $env:PLATFORMIO_CORE_DIR } else { Join-Path $env:USERPROFILE '.platformio' }
@@ -19,7 +18,7 @@ if (-not $ReuseFirmware) {
     $env:PLATFORMIO_BUILD_DIR = $firmwareBuild
     $pio = Get-Command pio -ErrorAction SilentlyContinue
     $command = if ($pio) { $pio.Source } else { Join-Path $platformHome 'penv/Scripts/platformio.exe' }
-    & $command run --project-dir $firmwareProject -e tallypager-pilot -e tallypager-esp8266-base
+    & $command run --project-dir $firmwareProject -e tallypager-pilot -e tallypager-esp8266-base -e tallypager-hotspot
     if ($LASTEXITCODE -ne 0) { throw 'Firmware-Build fehlgeschlagen.' }
 }
 
@@ -33,9 +32,6 @@ Expand-Archive -LiteralPath $zip -DestinationPath $tools -Force
 $esptool = Join-Path $tools 'esptool-windows-amd64'
 
 $images = @('bootloader.bin', 'partitions.bin', 'firmware.bin', 'boot_app0.bin')
-foreach ($name in $images[0..2]) {
-    Copy-Item -LiteralPath (Join-Path $firmware $name) -Destination $firmwarePackage
-}
 Copy-Item -LiteralPath (Join-Path $platformHome 'packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin') -Destination $firmwarePackage
 Copy-Item -LiteralPath (Join-Path $esptool 'esptool.exe') -Destination $bundle
 Copy-Item -LiteralPath (Join-Path $esptool 'LICENSE') -Destination (Join-Path $output 'esptool-LICENSE.txt')
@@ -44,16 +40,26 @@ LibAtem 1.0.0 — LGPL-3.0-or-later — https://github.com/LibAtem/LibAtem
 log4net 3.6.0 — Apache-2.0 — https://logging.apache.org/log4net/
 esptool 5.1.0 — see esptool-LICENSE.txt — https://github.com/espressif/esptool/tree/v5.1.0
 '@ | Set-Content -LiteralPath (Join-Path $output 'THIRD-PARTY-NOTICES.txt') -Encoding utf8NoBOM
-$sha256 = [ordered]@{}
-foreach ($name in $images) {
-    $sha256[$name] = (Get-FileHash -LiteralPath (Join-Path $firmwarePackage $name)).Hash.ToLowerInvariant()
-}
 $firmwareZip = Join-Path $output "TallyPager-Firmware-M5StickC-Plus2-$version.zip"
+$hotspotZip = Join-Path $output "TallyPager-Firmware-WLAN-Bruecke-M5StickC-Plus2-$version.zip"
 $manifest = Join-Path $firmwarePackage 'manifest.json'
-[ordered]@{board = 'm5stick-cplus2'; version = $version; sha256 = $sha256} |
-    ConvertTo-Json | Set-Content -LiteralPath $manifest -Encoding utf8NoBOM
-$files = @($images | ForEach-Object { Join-Path $firmwarePackage $_ }) + $manifest
-Compress-Archive -LiteralPath $files -DestinationPath $firmwareZip -Force
+
+function Write-M5FirmwarePackage($environment, $board, $destination) {
+    $build = Join-Path $firmwareBuild $environment
+    foreach ($name in $images[0..2]) {
+        Copy-Item -LiteralPath (Join-Path $build $name) -Destination $firmwarePackage
+    }
+    $sha256 = [ordered]@{}
+    foreach ($name in $images) {
+        $sha256[$name] = (Get-FileHash -LiteralPath (Join-Path $firmwarePackage $name)).Hash.ToLowerInvariant()
+    }
+    [ordered]@{board = $board; version = $version; sha256 = $sha256} |
+        ConvertTo-Json | Set-Content -LiteralPath $manifest -Encoding utf8NoBOM
+    $files = @($images | ForEach-Object { Join-Path $firmwarePackage $_ }) + $manifest
+    Compress-Archive -LiteralPath $files -DestinationPath $destination -Force
+}
+Write-M5FirmwarePackage 'tallypager-pilot' 'm5stick-cplus2' $firmwareZip
+Write-M5FirmwarePackage 'tallypager-hotspot' 'm5stick-cplus2-hotspot' $hotspotZip
 
 $esp8266Image = Join-Path $firmwareBuild 'tallypager-esp8266-base/firmware.bin'
 $esp8266Zip = Join-Path $output "TallyPager-Firmware-ESP8266-$version.zip"
@@ -75,7 +81,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Windows-Build fehlgeschlagen.' }
 
 $exe = Join-Path $output 'TallyPager-Windows-x64.exe'
 Copy-Item -LiteralPath (Join-Path $publish 'TallyPager.exe') -Destination $exe
-$releaseFiles = @($exe, $firmwareZip, $esp8266Zip)
+$releaseFiles = @($exe, $firmwareZip, $esp8266Zip, $hotspotZip)
 if ($Installer) {
     $compiler = (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source
     if (-not $compiler) {

@@ -72,6 +72,7 @@ try
     TestAcknowledgements(settings);
     TestFirmwareCompatibility(settings);
     TestRadioBridge(settings);
+    await TestHotspotBridge(settings);
     TestBasePreview(settings);
     await TestRemoteSlots(settings);
     TestRadioFragments();
@@ -101,10 +102,11 @@ try
             File.Delete(Path.Combine(settings, image.Name));
         }
         Console.WriteLine("PASS separate firmware package and image checksums");
-        await TestGitHubUpdate(settings, Path.GetFullPath(args[0]), args.Length > 1 ? Path.GetFullPath(args[1]) : null);
+        await TestGitHubUpdate(settings, Path.GetFullPath(args[0]), args.Length > 1 ? Path.GetFullPath(args[1]) : null,
+            args.Length > 2 ? Path.GetFullPath(args[2]) : null);
         if (args.Length > 1)
         {
-            PagerUsb.LoadFirmware(args[1], null, esp8266: true);
+            PagerUsb.LoadFirmware(args[1], null, target: FirmwareTarget.Esp8266);
             try
             {
                 PagerUsb.LoadFirmware(args[1], null);
@@ -112,6 +114,17 @@ try
             }
             catch (InvalidDataException) { }
             Console.WriteLine("PASS ESP8266 firmware package, checksums and board validation");
+        }
+        if (args.Length > 2)
+        {
+            PagerUsb.LoadFirmware(args[2], null, target: FirmwareTarget.Hotspot);
+            try
+            {
+                PagerUsb.LoadFirmware(args[2], null);
+                throw new InvalidOperationException("Hotspot firmware must never be accepted as the standard pager firmware");
+            }
+            catch (InvalidDataException) { }
+            Console.WriteLine("PASS separate M5Stick hotspot firmware image, manifest and checksums");
         }
     }
 }
@@ -340,7 +353,7 @@ static async Task TestDiagnosticStorage(string settings)
     Console.WriteLine("PASS bounded diagnostic history, periodic saving, restart, shutdown flush and corrupt-file recovery");
 }
 
-static async Task TestGitHubUpdate(string settings, string firmware, string? baseFirmware)
+static async Task TestGitHubUpdate(string settings, string firmware, string? baseFirmware, string? hotspotFirmware)
 {
     string exe = Path.Combine(Path.GetDirectoryName(firmware)!, GitHubUpdates.ExeName);
     if (!File.Exists(exe))
@@ -364,6 +377,9 @@ static async Task TestGitHubUpdate(string settings, string firmware, string? bas
     if (baseFirmware is not null)
         release = release with { Assets = [.. release.Assets, new(4, PagerUsb.Esp8266FirmwareFileName,
             new FileInfo(baseFirmware).Length, "sha256:" + Hash(baseFirmware), "uploaded")] };
+    if (hotspotFirmware is not null)
+        release = release with { Assets = [.. release.Assets, new(5, PagerUsb.HotspotFirmwareFileName,
+            new FileInfo(hotspotFirmware).Length, "sha256:" + Hash(hotspotFirmware), "uploaded")] };
     string root = Path.Combine(settings, "updates");
     var progress = new Progress<string>(_ => { });
     int executableDownloads = 0;
@@ -392,6 +408,8 @@ static async Task TestGitHubUpdate(string settings, string firmware, string? bas
             return new(HttpStatusCode.OK) { Content = new ByteArrayContent(sidecar) };
         if (uri.Host == "github.com" && name == PagerUsb.Esp8266FirmwareFileName && baseFirmware is not null)
             return new(HttpStatusCode.OK) { Content = new StreamContent(File.OpenRead(baseFirmware)) };
+        if (uri.Host == "github.com" && name == PagerUsb.HotspotFirmwareFileName && hotspotFirmware is not null)
+            return new(HttpStatusCode.OK) { Content = new StreamContent(File.OpenRead(hotspotFirmware)) };
         throw new InvalidOperationException($"Unexpected connection to {uri.Host}");
     }));
     var updater = new GitHubUpdates(client);
@@ -406,6 +424,9 @@ static async Task TestGitHubUpdate(string settings, string firmware, string? bas
         if (baseFirmware is not null)
             Check(Hash(Path.Combine(Path.GetDirectoryName(update.Executable)!, PagerUsb.Esp8266FirmwareFileName)) == Hash(baseFirmware),
                 "The optional headless firmware must be installed beside the Windows executable");
+        if (hotspotFirmware is not null)
+            Check(Hash(Path.Combine(Path.GetDirectoryName(update.Executable)!, PagerUsb.HotspotFirmwareFileName)) == Hash(hotspotFirmware),
+                "The optional hotspot firmware must be installed beside the Windows executable");
         var repeat = await updater.Download(found, root, progress, CancellationToken.None);
         Check(repeat == update && executableDownloads == 1, "An already verified update must not be downloaded again");
         try
@@ -729,6 +750,70 @@ static void TestRadioFragments()
     Check(radio.Receive(frames[^1], 405) == payload && radio.Receive(frames[^1], 406) is null,
         "Five fragments must reassemble exactly once");
     Console.WriteLine("PASS BLE packet layout, fragmentation and incomplete sequences");
+}
+
+static async Task TestHotspotBridge(string settings)
+{
+    const string endpoint = "c0a80402abe1", otherPort = "c0a80402abe2", nonce = "0123456789abcdef0123456789abcdef";
+    Check(RadioBridge.Parse($"TP LINK {endpoint} TP1|hello", Transport.Hotspot)?.Address == endpoint &&
+        RadioBridge.Parse("TP LINK c0a804010001 TP1|hello", Transport.Hotspot) is null &&
+        RadioBridge.Parse("TP LINK c0a804ff0001 TP1|hello", Transport.Hotspot) is null &&
+        RadioBridge.Parse("TP LINK c0a804020000 TP1|hello", Transport.Hotspot) is null &&
+        RadioBridge.Parse("TP LINK c0a805020001 TP1|hello", Transport.Hotspot) is null,
+        "The bridge must restrict addresses to the hotspot subnet and record the UDP port");
+    var status = PagerUsb.ParseStatus($$"""TP {"version":"{{PagerUsb.Version}}","id":"10061c286f4c","baseRole":true,"mode":"hotspot","radioReady":true,"ip":"192.168.4.1","hotspotSsid":"TallyPager-286f4c","features":["hotspot"]}""");
+    Check(status is not null && RadioBridge.CanConnect(status) && status.Firmware?.AllowsUsbMode("udp") == false,
+        "The hotspot must advertise its own firmware capability and base role");
+
+    string configuration = Path.Combine(settings, "devices.json");
+    string original = File.ReadAllText(configuration);
+    try
+    {
+        using var core = new PilotCore(settings, 0);
+        using var direct = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+        string directKey = core.Devices.Single().Key;
+        string directSession = Connect(direct, core, directKey, new string('e', 32));
+        string directSeen = $"TP1|seen|{id}|{directSession}|1|80";
+        Send(direct, core, directSeen, Tag(directSeen, directKey));
+        var pager = core.Prepare("123456789abe", "Hotspot-Stick");
+        core.Save(pager);
+        var bridge = new FakeRadio(Transport.Hotspot);
+        core.AttachRadio(bridge);
+        void Push(string body, string address = endpoint) => bridge.Inbound.Enqueue(new(address, body + "|" + Tag(body, pager.Key)));
+
+        Push($"TP1|hello|{pager.Id}|{nonce}");
+        core.Tick();
+        string session = bridge.Outbound.First().Payload.Split('|')[4];
+        string answer = $"TP1|ready|{pager.Id}|{nonce}|{session}";
+        Push(answer, otherPort);
+        core.Tick();
+        Check(bridge.Outbound.All(packet => !packet.Payload.Contains("|state|")), "A different UDP port cannot claim a pending session");
+        Push(answer);
+        core.Tick();
+        Push($"TP1|link|{pager.Id}|{session}|1|87|-65|20|6|1");
+        Push($"TP1|firmware|{pager.Id}|{session}|0.10.2|wifi-config,presentation,tally-labels,display-power");
+        Push($"TP1|cfg_info|{pager.Id}|{session}|0.10.2|192.168.4.1|486f7473706f74|||idle");
+        core.Tick();
+        core.Save(pager with { ConfiguredTransport = "udp" });
+        Check(core.Statuses().Single(p => p.Id == pager.Id) is
+            { Online: true, Transport: Transport.Hotspot, Address: "192.168.4.2", Rssi: -65, Settings.Host: "192.168.4.1" },
+            "An older UDP pager must appear with its IP and management settings through the hotspot");
+        core.SetPreview(pager.Id, new(3, 2, "Chat", "Next", Beamer: true));
+        Check(bridge.Outbound.TakeLast(2).All(p => p.Address == endpoint) &&
+            bridge.Outbound[^2].Payload.Contains("|state|") && bridge.Outbound[^1].Payload.Contains("|presentation|"),
+            "Tally, chat and presentation must go only to the selected hotspot endpoint");
+        var config = core.ChangeWifi(pager.Id, new("Hotspot", Transport.HotspotIp, "", ""));
+        var request = bridge.Outbound.Last().Payload.Split('|');
+        Check(request[1] == "cfg" && request[3] == session, "Wi-Fi configuration must use the authenticated hotspot path");
+        Push($"TP1|cfg_info|{pager.Id}|{session}|0.10.2|192.168.4.1|486f7473706f74||{request[4]}|applied");
+        core.Tick();
+        Check((await config.WaitAsync(TimeSpan.FromSeconds(1))).Result == "applied", "Configuration reply must return through USB");
+        core.AttachRadio(null);
+        Check(!core.Statuses().Single(p => p.Id == pager.Id).Online && core.Statuses().Single(p => p.Id == id).Online,
+            "Detaching the hotspot must not interrupt direct LAN UDP");
+    }
+    finally { File.WriteAllText(configuration, original); }
+    Console.WriteLine("PASS hotspot IP/port routing, older pager, Tally and Chat, settings, and parallel PC networking");
 }
 
 static async Task TestWifiManagement(string settings)

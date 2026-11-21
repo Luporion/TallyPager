@@ -73,7 +73,10 @@ internal sealed class PilotCore : IDisposable
     private IRadioBridge? bluetooth;
     private long lastBroadcast;
 
-    private sealed record Peer(IPEndPoint? Ip, IRadioBridge? Bridge = null, string? Mac = null);
+    private sealed record Peer(IPEndPoint? Ip, IRadioBridge? Bridge = null, string? Address = null)
+    {
+        public IPAddress? WifiAddress => Ip?.Address ?? (Bridge?.Mode == Transport.Hotspot ? Transport.HotspotAddress(Address) : null);
+    }
     private sealed record Offer(Peer Endpoint, string Nonce, string Session, long Expires);
     private sealed record ManagedPeer(IPEndPoint Endpoint, string Session, long Expires)
     {
@@ -203,7 +206,8 @@ internal sealed class PilotCore : IDisposable
         SaveDevices(entries);
         if (devices.TryGetValue(pager.Id, out var link))
         {
-            if (pager.ConfiguredTransport != link.Pager.ConfiguredTransport && pager.ConfiguredTransport is { } mode)
+            if (pager.ConfiguredTransport != link.Pager.ConfiguredTransport && pager.ConfiguredTransport is { } mode &&
+                (link.Active is null || Environment.TickCount64 - link.SeenAt >= 3500))
                 link.Transport = mode;
             link.Pager = pager;
         }
@@ -238,7 +242,7 @@ internal sealed class PilotCore : IDisposable
                 online ? link.Rssi : null, online ? link.Rtt : null, link.Preview, CanAcknowledge(link),
                 link.SentAt, link.ReceivedAt, link.AcknowledgedAt, link.SeenAt >= 0 ? age : null,
                 link.Transport, wifi, firmware ?? link.LastFirmware ??
-                    (online && link.Transport != "udp" ? FirmwareInfo.LegacyRadio : null),
+                    (online && Transport.IsRadio(link.Transport) ? FirmwareInfo.LegacyRadio : null),
                 address ?? link.LastAddress, address is null && link.LastAddress is not null,
                 canSwitch ? link.ActiveSlot : null, canSwitch ? link.Slots : null);
         }).ToArray();
@@ -318,7 +322,7 @@ internal sealed class PilotCore : IDisposable
     {
         if (bridge is null) return;
         for (int i = 0; i < 24 && bridge.TryRead(out var packet); i++)
-            if (packet.Payload.Length <= 900 && Transport.IsMac(packet.Address))
+            if (packet.Payload.Length <= 900 && Transport.ValidEndpoint(bridge.Mode, packet.Address))
                 Handle(new(null, bridge, packet.Address), packet.Payload);
     }
 
@@ -423,7 +427,7 @@ internal sealed class PilotCore : IDisposable
             throw new InvalidOperationException("Für diesen Stick läuft bereits eine Änderung.");
         var managed = CurrentManagement(link, now);
         var active = link.Settings is not null && link.Firmware?.Supports(FirmwareInfo.Wifi) == true && now - link.SeenAt < 3500 &&
-            link.Active?.Endpoint.Ip is not null ? link.Active : null;
+            link.Active?.Endpoint.WifiAddress is not null ? link.Active : null;
         if (managed?.Firmware?.Supports(FirmwareInfo.Wifi) != true) managed = null;
         if (active is null && managed is null)
             throw new InvalidOperationException("Der Stick ist nicht erreichbar. Bitte erneut im WLAN suchen.");
@@ -467,7 +471,7 @@ internal sealed class PilotCore : IDisposable
         }
         else if (!pending.Testing && now - pending.LastSent >= 750)
         {
-            Peer? target = link.Active is { Endpoint.Ip: not null } active && active.Session == pending.Session
+            Peer? target = link.Active is { Endpoint.WifiAddress: not null } active && active.Session == pending.Session
                 ? active.Endpoint : link.Managed is { } managed && managed.Session == pending.Session
                     ? new(managed.Endpoint) : null;
             if (target is null) return;
@@ -536,7 +540,7 @@ internal sealed class PilotCore : IDisposable
             link.Settings = null;
             link.Slots = [];
             link.ActiveSlot = null;
-            link.LastAddress = source.Ip?.Address.ToString() ?? Transport.DisplayAddress(source.Mac);
+            link.LastAddress = source.WifiAddress?.ToString() ?? Transport.DisplayAddress(source.Address);
             link.ConfigCounter = 0;
             link.DisplayCounter = 0;
             link.Transport = source.Bridge?.Mode ?? "udp";
@@ -576,14 +580,14 @@ internal sealed class PilotCore : IDisposable
             {
                 if (result == "testing") change.Testing = true;
                 else if (result is "rollback" or "rejected" || result == "applied" &&
-                    active.Session != change.Session && link.Transport == change.Slot.Mode && link.ActiveSlot == change.Slot.Number)
+                    active.Session != change.Session && Transport.PagerMode(link.Transport) == change.Slot.Mode && link.ActiveSlot == change.Slot.Number)
                 {
                     link.SlotChange = null;
                     change.Completion.TrySetResult(result);
                 }
             }
-            else if (source.Ip is { } ip && fields[1] == "cfg_info" &&
-                WifiManagement.Parse(fields, ip.Address) is { } settings)
+            else if (fields[1] == "cfg_info" && source.WifiAddress is { } address &&
+                WifiManagement.Parse(fields, address) is { } settings)
             {
                 link.Settings = settings;
                 ObserveFirmware(link, FirmwareInfo.Read(settings.Version));
@@ -688,7 +692,7 @@ internal sealed class PilotCore : IDisposable
     {
         string packet = body + "|" + Convert.ToHexStringLower(Signature(link.Pager.Key, body));
         if (endpoint.Ip is { } ip) return udp.Send(Encoding.ASCII.GetBytes(packet), ip) > 0;
-        return endpoint.Bridge is { } bridge && endpoint.Mac is { } mac && bridge.Send(mac, packet);
+        return endpoint.Bridge is { } bridge && endpoint.Address is { } address && bridge.Send(address, packet);
     }
 
     private static byte[] Signature(string key, string body) =>
