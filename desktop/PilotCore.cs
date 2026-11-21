@@ -325,7 +325,7 @@ internal sealed class PilotCore : IDisposable
         for (int i = 0; i < 24 && bridge.TryRead(out var packet); i++)
         {
             string route = packet.Transport ?? bridge.Mode;
-            if (packet.Payload.Length <= 900 && route != Transport.Hybrid && Transport.Serves(bridge.Mode, route) &&
+            if (packet.Payload.Length <= 900 && !Transport.IsHybrid(route) && Transport.Serves(bridge.Mode, route) &&
                 Transport.ValidEndpoint(route, packet.Address))
                 Handle(new(null, bridge, packet.Address, packet.Transport), packet.Payload);
         }

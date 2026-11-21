@@ -1,3 +1,5 @@
+using System.Net;
+
 namespace TallyPager;
 
 internal sealed partial class MainWindow
@@ -78,7 +80,7 @@ internal sealed partial class MainWindow
         Full(setupBase, new Label
         {
             AutoSize = true, MaximumSize = new Size(700, 0),
-            Text = "ESP8266MOD mit 4 MB Flash. Nach dem Flashen stehen oben ESP-NOW, WLAN-Brücke und beide zusammen zur Wahl. " +
+            Text = "ESP8266MOD mit 4 MB Flash. Ab Version 0.15.0 steht oben auch „ESP-NOW + WLAN + Mumble“ zur Wahl. " +
                 "Mit WLAN-Brücke Kanal 1, 6 oder 11 wählen. Im Kombimodus verwenden beide Funkwege diesen Kanal."
         });
         AddWindowsBluetoothControls(setupBase);
@@ -143,7 +145,7 @@ internal sealed partial class MainWindow
     private void ShowBaseModes(UsbStatus? status)
     {
         string previous = SelectedTransport(baseTransport);
-        string[] possible = status?.Board == "esp8266" ? ["espnow", Transport.Hotspot, Transport.Hybrid] :
+        string[] possible = status?.Board == "esp8266" ? ["espnow", Transport.Hotspot, Transport.Hybrid, Transport.Mumble] :
             ["espnow", "espnow-lr", "ble"];
         string[] modes = possible
             .Where(mode => status is null || status.Firmware?.AllowsBase(mode) == true).ToArray();
@@ -195,7 +197,8 @@ internal sealed partial class MainWindow
         try
         {
             baseStatus.Text = "Funkbasis wird geprüft …";
-            var bridge = await Task.Run(() => RadioBridge.Connect(port));
+            var server = IPAddress.TryParse(mumbleServer.SelectedItem as string, out var selected) ? selected : IPAddress.Loopback;
+            var bridge = await Task.Run(() => RadioBridge.Connect(port, server));
             if (bridge.Mode == "ble" && windowsBluetooth is not null)
             {
                 bridge.Dispose();
@@ -213,6 +216,7 @@ internal sealed partial class MainWindow
                 (baseInfo.Mode != "ble" ? $" · Kanal {baseInfo.Channel}" : "");
             core.Diagnostics.Add("USB-Funkbasis", "Basis verbunden", Transport.Name(baseInfo.Mode));
             UpdateProvisionFields();
+            RefreshMumbleStatus();
         }
         catch (Exception error) { baseStatus.Text = error.Message; }
         finally { basePort.Enabled = true; busy = false; }
@@ -226,6 +230,7 @@ internal sealed partial class MainWindow
         activeRadio = null;
         baseLink!.Text = "Funkbasis verbinden";
         baseStatus.Text = notice;
+        RefreshMumbleStatus();
     }
 
     private async Task ConfigureBase(bool restore)
@@ -269,6 +274,7 @@ internal sealed partial class MainWindow
         {
             lastBasePreview = Environment.TickCount64;
             bridge.SendBaseView(core.Statuses());
+            RefreshMumbleStatus();
         }
         if (tabs.SelectedTab != setup || !wifiSetupSelected) return;
         var selected = SelectedPager();

@@ -74,6 +74,7 @@ try
     TestRadioBridge(settings);
     await TestHotspotBridge(settings);
     TestHybridBridge(settings);
+    await TestMumbleRelay();
     TestHotspotSecurity();
     TestBasePreview(settings);
     await TestRemoteSlots(settings);
@@ -821,6 +822,109 @@ static void TestRadioFragments()
     Check(radio.Receive(frames[^1], 405) == payload && radio.Receive(frames[^1], 406) is null,
         "Five fragments must reassemble exactly once");
     Console.WriteLine("PASS BLE packet layout, fragmentation and incomplete sequences");
+}
+
+static async Task TestMumbleRelay()
+{
+    const uint first = 0x10203040, second = 0x10203041;
+    const string mac = "10061c286f4c", endpoint = "c0a80402abe1";
+    Check(RadioBridge.Parse($"TP LINK {mac} TP1|hello", Transport.Mumble) is { Transport: "espnow" } &&
+        RadioBridge.Parse($"TP WIFI {endpoint} TP1|hello", Transport.Mumble) is { Transport: Transport.Hotspot } &&
+        RadioBridge.Format(Transport.Mumble, mac, "TP1|test", "espnow") == $"TP LINK {mac} TP1|test" &&
+        RadioBridge.Format(Transport.Mumble, endpoint, "TP1|test", Transport.Hotspot) == $"TP WIFI {endpoint} TP1|test",
+        "Mumble mode must preserve both Tally transports");
+    var status = PagerUsb.ParseStatus($$"""TP {"version":"{{PagerUsb.Version}}","id":"{{mac}}","board":"esp8266","baseRole":true,"mode":"espnow-mumble","radioReady":true,"mumbleReady":true,"features":["radio-base","hotspot","espnow","espnow-hotspot","espnow-mumble"]}""");
+    Check(status is { MumbleReady: true } && RadioBridge.CanConnect(status) &&
+        FirmwareCatalog.CompatibleTargets(FirmwareTarget.Esp8266).Contains(FirmwareTarget.Esp8266) &&
+        new FirmwareChoice(FirmwareTarget.Esp8266, new(0, 15, 0)).ToString().Contains("mit Mumble") &&
+        !new FirmwareChoice(FirmwareTarget.Esp8266, new(0, 14, 0)).ToString().Contains("mit Mumble"),
+        "A Mumble-capable firmware must be visible and a legacy package must keep its label");
+    var listener = new TcpListener(IPAddress.Loopback, 0);
+    listener.Start();
+    int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+    using var udp = new UdpClient(new IPEndPoint(IPAddress.Loopback, port));
+    using var relay = new MumbleRelay(IPAddress.Loopback, port);
+    using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(12));
+    long Now() => Environment.TickCount64;
+    async Task<MumbleRelay.Frame> Output(uint id, char operation)
+    {
+        while (true)
+        {
+            deadline.Token.ThrowIfCancellationRequested();
+            var line = relay.NextOutput(Now());
+            if (line is not null && MumbleRelay.Parse(line) is { } frame && frame.Op != 'H')
+            {
+                Check(frame.Id == id && frame.Op == operation, $"Expected Mumble {id:x8}/{operation}, got {frame.Id:x8}/{frame.Op}: {relay.LastError}");
+                return frame;
+            }
+            await Task.Delay(1, deadline.Token);
+        }
+    }
+    void Input(uint id, char operation, byte[]? data = null) => relay.Receive(MumbleRelay.Format(id, operation, data), Now());
+
+    try
+    {
+        await Output(0, 'R');
+        Input(first, 'O');
+        using var callerA = await listener.AcceptTcpClientAsync(deadline.Token);
+        await Output(first, 'R');
+        Input(second, 'O');
+        using var callerB = await listener.AcceptTcpClientAsync(deadline.Token);
+        await Output(second, 'R');
+        Check(relay.Clients == 2, "Both Mumble sessions must have independent TCP connections");
+        Input(second + 1, 'O');
+        await Output(second + 1, 'C');
+
+        byte[] incoming = RandomNumberGenerator.GetBytes(MumbleRelay.TcpChunk);
+        Input(first, 'D', incoming);
+        await Output(first, 'A');
+        byte[] received = new byte[incoming.Length];
+        await callerA.GetStream().ReadExactlyAsync(received, deadline.Token);
+        Check(incoming.SequenceEqual(received) && callerB.Available == 0, "TCP binary data must reach only the intended call");
+
+        byte[] reply = RandomNumberGenerator.GetBytes(1900);
+        await callerB.GetStream().WriteAsync(reply, deadline.Token);
+        using var receivedReply = new MemoryStream();
+        while (receivedReply.Length < reply.Length)
+        {
+            var frame = await Output(second, 'D');
+            Check(frame.Data is { Length: > 0 and <= MumbleRelay.TcpChunk }, "TCP fragments must fit the firmware receive window");
+            receivedReply.Write(frame.Data!);
+            var stalled = relay.NextOutput(Now());
+            Check(stalled is null || MumbleRelay.Parse(stalled) is { Op: 'H' }, "TCP must wait for a serial ACK before sending another chunk");
+            Input(second, 'A');
+        }
+        Check(reply.SequenceEqual(receivedReply.ToArray()), "TCP byte order and delivery must survive serial fragmentation");
+
+        var voiceA = RandomNumberGenerator.GetBytes(MumbleRelay.MaxDatagram);
+        var voiceB = RandomNumberGenerator.GetBytes(67);
+        Input(first, 'U', voiceA);
+        var fromA = await udp.ReceiveAsync(deadline.Token);
+        Input(second, 'U', voiceB);
+        var fromB = await udp.ReceiveAsync(deadline.Token);
+        Check(voiceA.SequenceEqual(fromA.Buffer) && voiceB.SequenceEqual(fromB.Buffer) &&
+            fromA.RemoteEndPoint.Port != fromB.RemoteEndPoint.Port, "Both phones need separate UDP source ports and intact voice datagrams");
+        await udp.SendAsync(voiceA, fromB.RemoteEndPoint, deadline.Token);
+        Check((await Output(second, 'U')).Data!.SequenceEqual(voiceA), "UDP return traffic must follow the correct call");
+        await udp.SendAsync(voiceB, fromA.RemoteEndPoint, deadline.Token);
+        Check((await Output(first, 'U')).Data!.SequenceEqual(voiceB), "UDP reply must remain a single intact datagram");
+        Check(MumbleRelay.Parse(MumbleRelay.Format(first, 'U', new byte[MumbleRelay.MaxDatagram + 1])) is null &&
+            MumbleRelay.Parse("TP M 10203040 D AAA=") is { Data.Length: 2 } &&
+            MumbleRelay.Parse("TP M 10203040 D ABC?") is null &&
+            RadioBridge.Parse(MumbleRelay.Format(first, 'U', voiceB), Transport.Mumble) is null,
+            "Malformed media and oversized packets must not interfere with Tally framing");
+
+        Input(first, 'C');
+        callerB.Close();
+        await Output(second, 'C');
+        Check(relay.Clients == 0, "Closed Mumble calls must release both sockets");
+        listener.Stop();
+        Input(first, 'O');
+        await Output(first, 'C');
+        Check(relay.LastError is not null, "An unreachable local server must be visible in the UI");
+    }
+    finally { listener.Stop(); }
+    Console.WriteLine("PASS ESP8266 Mumble mode, simultaneous TCP sessions, binary ACK flow control, independent UDP audio and failure recovery");
 }
 
 static void TestHotspotSecurity()

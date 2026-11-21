@@ -21,6 +21,7 @@ internal sealed class FirmwareInfo
         [RadioBase] = "Funkbasis",
         [Transport.Hotspot] = "WLAN-Brücke per USB",
         [Transport.Hybrid] = "WLAN-Brücke und ESP-NOW gleichzeitig",
+        [Transport.Mumble] = "ESP-NOW, WLAN und Mumble über USB",
         [HotspotSecurity] = "WLAN-Schutz der Brücke einstellen",
         ["espnow"] = "ESP-NOW",
         ["espnow-lr"] = "ESP-NOW LR",
@@ -81,13 +82,13 @@ internal sealed class FirmwareInfo
     public bool Supports(string feature) => features?.Contains(feature, StringComparer.Ordinal) == true;
     public bool AllowsUsbMode(string mode) => Supports(Usb) && (mode == "udp" || Supports(mode));
     public bool AllowsBase(string mode) => mode == Transport.Hotspot ? Supports(Transport.Hotspot) :
-        (Transport.IsRadio(mode) || mode == Transport.Hybrid) && Supports(RadioBase) && Supports(mode);
+        (Transport.IsRadio(mode) || Transport.IsHybrid(mode)) && Supports(RadioBase) && Supports(mode);
     public bool Older => ExactVersion && VersionNumber < Ui;
     public bool Newer => ExactVersion && VersionNumber > Ui;
     public string ShortVersion => !ExactVersion ? $"≥ {VersionText}" :
         Older ? VersionText + " · älter" : Newer ? VersionText + " · neuer" : VersionText;
 
-    public string[] Missing => features is null ? [] : Known.Where(pair => pair.Key is not (Transport.Hotspot or Transport.Hybrid or HotspotSecurity) && !Supports(pair.Key))
+    public string[] Missing => features is null ? [] : Known.Where(pair => pair.Key is not (Transport.Hotspot or Transport.Hybrid or Transport.Mumble or HotspotSecurity) && !Supports(pair.Key))
         .Select(pair => pair.Value).ToArray();
     public string[] Available => features is null ? [] : Known.Where(pair => Supports(pair.Key)).Select(pair => pair.Value).ToArray();
     public string[] Unknown => features is null ? [] : features.Where(id => !Known.ContainsKey(id)).ToArray();

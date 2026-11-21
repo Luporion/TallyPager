@@ -1,4 +1,5 @@
 using System.IO.Ports;
+using System.Net;
 using System.Threading.Channels;
 
 namespace TallyPager;
@@ -16,6 +17,7 @@ internal sealed class RadioBridge : IRadioBridge
     private const string Prefix = "TP LINK ";
     private const string WifiPrefix = "TP WIFI ";
     private readonly SerialPort serial;
+    private readonly MumbleRelay? mumble;
     private readonly Channel<RadioPacket> inbound = Channel.CreateBounded<RadioPacket>(64);
     private readonly Channel<string> outbound = Channel.CreateBounded<string>(24);
     private volatile bool closed;
@@ -24,16 +26,19 @@ internal sealed class RadioBridge : IRadioBridge
     public UsbStatus Status { get; }
     public string Mode => Status.Mode;
     public string Port => serial.PortName;
+    public int MumbleClients => mumble?.Clients ?? 0;
+    public string? MumbleError => mumble?.LastError;
 
-    private RadioBridge(SerialPort serial, UsbStatus status)
+    private RadioBridge(SerialPort serial, UsbStatus status, IPAddress mumbleServer)
     {
         this.serial = serial;
         Status = status;
+        if (status.Mode == Transport.Mumble && status.MumbleReady) mumble = new(mumbleServer);
         serial.WriteTimeout = 200;
         _ = Task.Run(Pump);
     }
 
-    public static RadioBridge Connect(string port)
+    public static RadioBridge Connect(string port, IPAddress? mumbleServer = null)
     {
         var serial = PagerUsb.Open(port);
         try
@@ -41,7 +46,7 @@ internal sealed class RadioBridge : IRadioBridge
             var status = PagerUsb.ReadStatus(serial, TimeSpan.FromSeconds(5));
             if (!CanConnect(status))
                 throw new InvalidOperationException("Am USB-Port antwortet keine betriebsbereite TallyPager-Funkbasis.");
-            return new(serial, status);
+            return new(serial, status, mumbleServer ?? IPAddress.Loopback);
         }
         catch { serial.Dispose(); throw; }
     }
@@ -56,8 +61,8 @@ internal sealed class RadioBridge : IRadioBridge
     internal static string? Format(string mode, string address, string payload, string? transport)
     {
         string route = transport ?? mode;
-        if (route == Transport.Hybrid || !Transport.Serves(mode, route) || !Transport.ValidEndpoint(route, address)) return null;
-        return (mode == Transport.Hybrid && route == Transport.Hotspot ? WifiPrefix : Prefix) + address + " " + payload;
+        if (Transport.IsHybrid(route) || !Transport.Serves(mode, route) || !Transport.ValidEndpoint(route, address)) return null;
+        return (Transport.IsHybrid(mode) && route == Transport.Hotspot ? WifiPrefix : Prefix) + address + " " + payload;
     }
 
     public void SendBaseView(PagerStatus[] pagers)
@@ -100,46 +105,62 @@ internal sealed class RadioBridge : IRadioBridge
 
     private async Task Pump()
     {
-        const int limit = 921;
+        int limit = mumble is null ? 921 : MumbleRelay.MaxLine + 1;
         var line = new System.Text.StringBuilder(limit);
         bool overflow = false;
         try
         {
             while (!closed)
             {
+                long now = Environment.TickCount64;
                 for (int i = 0; i < 4 && outbound.Reader.TryRead(out var send); i++)
                     serial.WriteLine(send);
                 foreach (char ch in serial.ReadExisting())
                 {
                     if (ch == '\n')
                     {
-                        if (!overflow && Parse(line.ToString().TrimEnd('\r'), Mode) is { } packet)
-                            inbound.Writer.TryWrite(packet);
+                        if (!overflow)
+                        {
+                            string message = line.ToString().TrimEnd('\r');
+                            if (mumble is not null && message.StartsWith(MumbleRelay.Prefix, StringComparison.Ordinal))
+                                mumble.Receive(message, now);
+                            else if (Parse(message, Mode) is { } packet)
+                                inbound.Writer.TryWrite(packet);
+                        }
                         overflow = false;
                         line.Clear();
                     }
                     else if (line.Length < limit) line.Append(ch);
                     else overflow = true;
                 }
-                await Task.Delay(5).ConfigureAwait(false);
+                if (mumble is not null)
+                {
+                    for (int i = 0; i < 3 && serial.BytesToWrite < 512 && mumble.NextOutput(now) is { } audio; i++)
+                        serial.WriteLine(audio);
+                }
+                await Task.Delay(mumble is null ? 5 : 2).ConfigureAwait(false);
             }
         }
         catch (Exception error) when (error is IOException or InvalidOperationException or TimeoutException or UnauthorizedAccessException)
         {
             if (!closed) failure = error.Message;
         }
-        finally { serial.Dispose(); }
+        finally
+        {
+            mumble?.Dispose();
+            serial.Dispose();
+        }
     }
 
     internal static RadioPacket? Parse(string line, string mode = "espnow")
     {
         if (line.Length is <= 21 or > 921 || line[20] != ' ' || !line.AsSpan(21).StartsWith("TP1|", StringComparison.Ordinal)) return null;
-        string? route = mode == Transport.Hybrid ?
+        string? route = Transport.IsHybrid(mode) ?
             (line.StartsWith(WifiPrefix, StringComparison.Ordinal) ? Transport.Hotspot :
                 line.StartsWith(Prefix, StringComparison.Ordinal) ? "espnow" : null) :
             line.StartsWith(Prefix, StringComparison.Ordinal) ? mode : null;
         return route is not null && Transport.ValidEndpoint(route, line[8..20])
-            ? new(line[8..20], line[21..], mode == Transport.Hybrid ? route : null) : null;
+            ? new(line[8..20], line[21..], Transport.IsHybrid(mode) ? route : null) : null;
     }
 
     public void Dispose() { closed = true; serial.Dispose(); }
@@ -149,9 +170,11 @@ internal static class Transport
 {
     public const string Hotspot = "hotspot";
     public const string Hybrid = "espnow-hotspot";
+    public const string Mumble = "espnow-mumble";
     public const string HotspotIp = "192.168.4.1";
     public static bool Serves(string? baseMode, string transport) => baseMode == transport ||
-        baseMode == Hybrid && transport is Hotspot or "espnow";
+        IsHybrid(baseMode) && transport is Hotspot or "espnow";
+    public static bool IsHybrid(string? mode) => mode is Hybrid or Mumble;
     public static string PagerMode(string transport) => transport == Hotspot ? "udp" : transport;
     public static bool ValidEndpoint(string mode, string address) => mode == Hotspot ? HotspotAddress(address) is not null : IsMac(address);
     public static System.Net.IPAddress? HotspotAddress(string? address)
@@ -174,6 +197,6 @@ internal static class Transport
     public static string Name(string mode) => mode switch
     {
         "espnow" => "ESP-NOW", "espnow-lr" => "ESP-NOW LR", "ble" => "BLE", Hotspot => "WLAN-Brücke",
-        Hybrid => "WLAN-Brücke + ESP-NOW", _ => "WLAN + UDP"
+        Hybrid => "WLAN-Brücke + ESP-NOW", Mumble => "ESP-NOW + WLAN + Mumble", _ => "WLAN + UDP"
     };
 }

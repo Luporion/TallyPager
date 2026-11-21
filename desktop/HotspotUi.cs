@@ -11,6 +11,8 @@ internal sealed partial class MainWindow
         UseSystemPasswordChar = true, MaxLength = 63, PlaceholderText = "8 bis 63 Zeichen (ASCII)"
     };
     private readonly Label hotspotStatus = Notice();
+    private readonly ComboBox mumbleServer = Choices();
+    private readonly Label mumbleStatus = Notice();
     private UsbStatus? hotspotInfo;
     private Button? applyHotspot, changeHotspotChannel, changeHotspotSecurity;
     private CheckBox? revealHotspotPassword, revealNewHotspotPassword;
@@ -44,6 +46,38 @@ internal sealed partial class MainWindow
         Full(grid, Buttons(applyHotspot));
         Full(grid, hotspotStatus);
         ShowHotspot(null);
+
+        var voice = SetupSection(parent, "Mumble über WLAN");
+        Row(voice, "Mumble-Server am PC", mumbleServer);
+        RefreshMumbleServerAddresses([]);
+        SetupHint(voice, "Für den Funkmodus „ESP-NOW + WLAN + Mumble“. Handy mit dem WLAN der Funkbasis verbinden und in Mumble 192.168.4.1, Port 64738, eintragen. Der Mumble-Server läuft auf diesem Rechner.");
+        Full(voice, mumbleStatus);
+        RefreshMumbleStatus();
+    }
+
+    private void RefreshMumbleServerAddresses(string[] addresses)
+    {
+        string[] options = ["127.0.0.1", .. addresses];
+        if (mumbleServer.Items.Cast<string>().SequenceEqual(options)) return;
+        string selected = mumbleServer.SelectedItem as string ?? options[0];
+        mumbleServer.Items.Clear();
+        mumbleServer.Items.AddRange(options);
+        mumbleServer.SelectedItem = options.Contains(selected) ? selected : options[0];
+    }
+
+    private void RefreshMumbleStatus()
+    {
+        var bridge = activeRadio;
+        mumbleServer.Enabled = bridge?.Mode != Transport.Mumble;
+        if (bridge?.Mode != Transport.Mumble)
+            mumbleStatus.Text = "Bereit zum Einrichten mit ESP8266-Firmware ab 0.15.0.";
+        else if (!bridge.Status.MumbleReady)
+            mumbleStatus.Text = "Mumble konnte auf der Funkbasis nicht gestartet werden. Tally bleibt aktiv.";
+        else
+        {
+            string clients = $"Mumble aktiv · {bridge.MumbleClients}/2 Geräte verbunden";
+            mumbleStatus.Text = bridge.MumbleError is { } error ? clients + "\n" + error : clients;
+        }
     }
 
     private void ShowHotspot(UsbStatus? status)
@@ -128,7 +162,7 @@ internal sealed partial class MainWindow
     {
         if (busy || changingModes || hotspotInfo is not { } status || basePort.SelectedItem is not string port ||
             hotspotChannel.SelectedItem is not int channel || status.Channel == channel) return;
-        if (MessageBox.Show(this, status.Mode == Transport.Hybrid ?
+        if (MessageBox.Show(this, Transport.IsHybrid(status.Mode) ?
                 "Der Kanalwechsel startet die Basis neu. Die ESP-NOW-Pager brauchen danach denselben neuen Kanal." :
                 "Beim Kanalwechsel startet der Hotspot neu. Kanal jetzt wechseln?",
             "WLAN-Kanal wechseln", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;

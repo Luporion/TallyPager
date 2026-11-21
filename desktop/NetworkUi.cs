@@ -94,6 +94,7 @@ internal sealed partial class MainWindow
                 .Where(ip => ip.AddressFamily == AddressFamily.InterNetwork)
                 .Select(ip => ip.ToString()).Distinct()
                 .OrderByDescending(ip => ip.StartsWith("192.168.", StringComparison.Ordinal)).ToArray();
+            RefreshMumbleServerAddresses(found);
             if (addresses.Items.Cast<string>().SequenceEqual(found)) return;
             string current = addresses.Text;
             addresses.BeginUpdate();

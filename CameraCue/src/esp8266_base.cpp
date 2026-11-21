@@ -3,6 +3,7 @@
 #include <EEPROM.h>
 #include <ESP8266WiFi.h>
 #include "hotspot_link.h"
+#include "mumble_link.h"
 extern "C" {
 #include <espnow.h>
 #include <user_interface.h>
@@ -11,7 +12,7 @@ extern "C" {
 
 namespace {
 using namespace radio_frame;
-enum class Mode : uint8_t { EspNow, Hotspot, Both };
+enum class Mode : uint8_t { EspNow, Hotspot, Both, Mumble };
 Mode mode = Mode::EspNow;
 constexpr size_t automaticLength = 16, maxPasswordLength = 63;
 constexpr int passwordStored = 3, passwordOffset = 4;
@@ -19,12 +20,15 @@ constexpr int passwordStored = 3, passwordOffset = 4;
 constexpr int securityOffset = passwordOffset + automaticLength;
 constexpr int customLengthOffset = securityOffset + 1, customPasswordOffset = customLengthOffset + 1;
 constexpr int securitySize = 2 + maxPasswordLength;
+constexpr int mumbleOffset = securityOffset + securitySize;
+constexpr uint8_t mumbleEnabled = 0x4d;
 enum class Security : uint8_t { Automatic = 0xff, Custom = 0x50, Open = 0x4f };
 Security security = Security::Automatic;
 hotspot::Link wifiLink;
+mumble::Link mumbleLink;
 char wifiPassword[maxPasswordLength + 1]{};
 String wifiName;
-bool wifiReady = false, espNowReady = false;
+bool wifiReady = false, espNowReady = false, mumbleReady = false;
 constexpr unsigned receiveSlots = 17;
 struct ReceivedFrame {
   uint8_t sender[6], bytes[headerSize + fragmentSize], length;
@@ -45,7 +49,7 @@ uint8_t part = 0, channel = 6, deviceAddress[6], nowAddress[6];
 volatile int sendResult = 0;
 uint32_t sentAt = 0, restartAt = 0;
 bool waiting = false, overflow = false;
-char line[hotspot::envelopeSize + packetLimit + 1];
+char line[mumble::maxLine + 1];
 size_t used = 0;
 
 String mac(const uint8_t* address) {
@@ -64,7 +68,9 @@ bool parseMac(const char* text, uint8_t* address) {
 
 bool hasHotspot() { return mode != Mode::EspNow; }
 bool hasEspNow() { return mode != Mode::Hotspot; }
+bool hybrid() { return hasHotspot() && hasEspNow(); }
 const char* modeName() {
+  if (mode == Mode::Mumble) return "espnow-mumble";
   return mode == Mode::Both ? "espnow-hotspot" : mode == Mode::Hotspot ? "hotspot" : "espnow";
 }
 
@@ -168,6 +174,7 @@ void status() {
   if (espNowReady) doc["radioAddress"] = mac(nowAddress);
   doc["channel"] = channel;
   doc["radioReady"] = ready;
+  if (mode == Mode::Mumble) doc["mumbleReady"] = mumbleReady;
   if (hasHotspot()) doc["hotspotSecurity"] = securityName();
   if (wifiReady) {
     doc["ip"] = hotspot::gateway.toString();
@@ -180,6 +187,7 @@ void status() {
   features.add("hotspot");
   features.add("espnow-hotspot");
   features.add("hotspot-security");
+  features.add("espnow-mumble");
   Serial.print("TP ");
   serializeJson(doc, Serial);
   Serial.println();
@@ -197,6 +205,7 @@ void command() {
     if (!strcmp(name, "espnow")) requestedMode = Mode::EspNow;
     else if (!strcmp(name, "hotspot")) requestedMode = Mode::Hotspot;
     else if (!strcmp(name, "espnow-hotspot")) requestedMode = Mode::Both;
+    else if (!strcmp(name, "espnow-mumble")) requestedMode = Mode::Mumble;
     else { Serial.println("TP ERROR mode"); return; }
     int requested = doc["channel"].as<int>();
     if (requested < 1 || requested > 13 || (requestedMode != Mode::EspNow && !hotspot::validChannel(requested))) {
@@ -204,13 +213,16 @@ void command() {
     }
     EEPROM.write(0, 0x54);
     EEPROM.write(1, requested);
-    EEPROM.write(2, static_cast<uint8_t>(requestedMode));
+    // Older firmware can still start the same ESP-NOW/WLAN combination after a downgrade.
+    EEPROM.write(2, static_cast<uint8_t>(requestedMode == Mode::Mumble ? Mode::Both : requestedMode));
+    EEPROM.write(mumbleOffset, requestedMode == Mode::Mumble ? mumbleEnabled : 0xff);
     if (!EEPROM.commit()) { Serial.println("TP ERROR eeprom"); return; }
     Serial.println("TP OK");
     restartAt = millis() + 350;
     return;
   }
-  const char* wifiPrefix = mode == Mode::Both ? hotspot::wifiPrefix : hotspot::linkPrefix;
+  if (mumbleReady && strncmp(line, mumble::prefix, 5) == 0) { mumbleLink.fromSerial(line, used); return; }
+  const char* wifiPrefix = hybrid() ? hotspot::wifiPrefix : hotspot::linkPrefix;
   if (wifiReady && strncmp(line, wifiPrefix, 8) == 0) { wifiLink.fromSerial(line, used, wifiPrefix); return; }
   if (!espNowReady || used <= hotspot::envelopeSize || strncmp(line, hotspot::linkPrefix, 8) != 0 || line[20] != ' ' ||
       !hotspot::tallyPayload(line + hotspot::envelopeSize, used - hotspot::envelopeSize)) return;
@@ -264,11 +276,12 @@ void radioTick() {
 }
 
 void setup() {
-  EEPROM.begin(securityOffset + securitySize);
+  EEPROM.begin(mumbleOffset + 1);
   uint8_t stored = EEPROM.read(1);
   if (EEPROM.read(0) == 0x54) {
     uint8_t savedMode = EEPROM.read(2);
     if (savedMode <= static_cast<uint8_t>(Mode::Both)) mode = static_cast<Mode>(savedMode);
+    if (mode == Mode::Both && EEPROM.read(mumbleOffset) == mumbleEnabled) mode = Mode::Mumble;
     if (stored >= 1 && stored <= 13 && (!hasHotspot() || hotspot::validChannel(stored))) channel = stored;
   }
   Serial.setRxBufferSize(hasHotspot() ? 4096 : 2048);
@@ -294,6 +307,7 @@ void setup() {
       esp_now_set_self_role(ESP_NOW_ROLE_COMBO) == 0 &&
       esp_now_register_recv_cb(receiveFrame) == 0 &&
       esp_now_register_send_cb([](uint8_t*, uint8_t result) { sendResult = result == 0 ? 1 : -1; }) == 0;
+  mumbleReady = mode == Mode::Mumble && wifiReady && mumbleLink.begin(os_random());
 }
 
 void loop() {
@@ -308,7 +322,8 @@ void loop() {
     else if (!overflow) line[used++] = ch;
   }
   if (espNowReady) radioTick();
-  if (wifiReady) wifiLink.toSerial(mode == Mode::Both ? hotspot::wifiPrefix : hotspot::linkPrefix);
+  if (wifiReady) wifiLink.toSerial(hybrid() ? hotspot::wifiPrefix : hotspot::linkPrefix);
+  if (mumbleReady) mumbleLink.tick();
   if (restartAt && static_cast<int32_t>(millis() - restartAt) >= 0) ESP.restart();
   delay(0);
 }

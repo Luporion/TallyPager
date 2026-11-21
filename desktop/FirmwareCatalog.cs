@@ -2,7 +2,8 @@ namespace TallyPager;
 
 internal sealed record FirmwareChoice(FirmwareTarget Target, Version Version, string? LocalPath = null, GitHubRelease? Release = null)
 {
-    public override string ToString() => $"{Version} · {(LocalPath is null ? "GitHub" : "Lokal")}";
+    public override string ToString() => $"{Version} · {(LocalPath is null ? "GitHub" : "Lokal")}" +
+        (Target == FirmwareTarget.Esp8266 && Version >= new Version(0, 15, 0) ? " · mit Mumble" : "");
 }
 
 internal static class FirmwareCatalog

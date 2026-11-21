@@ -12,7 +12,7 @@ internal sealed record UsbStatus(string Version, string Id, bool Configured, boo
     bool Core, int Inside, int Outside, string Cue, string Next, string Mode = "udp",
     bool BaseRole = false, string RadioAddress = "", int Channel = 6, bool RadioReady = false,
     string[]? Features = null, int Slot = 0, string Board = "m5stick-cplus2",
-    string HotspotSsid = "", string HotspotPassword = "", string HotspotSecurity = "")
+    string HotspotSsid = "", string HotspotPassword = "", string HotspotSecurity = "", bool MumbleReady = false)
 {
     public FirmwareInfo? Firmware => FirmwareInfo.Read(Version, Features);
     public bool CanConfigureHotspotSecurity => Board == "esp8266" && BaseRole && Transport.Serves(Mode, Transport.Hotspot) &&
@@ -33,7 +33,7 @@ internal sealed record UsbHardware(FirmwareTarget? Target, string Description);
 
 internal static class PagerUsb
 {
-    public const string Version = "0.14.0";
+    public const string Version = "0.15.0";
     public const string Esp8266FirmwareFileName = "TallyPager-Firmware-ESP8266-" + Version + ".zip";
     public const string HotspotFirmwareFileName = "TallyPager-Firmware-WLAN-Bruecke-M5StickC-Plus2-" + Version + ".zip";
     private const int StandardBaud = 115200, HotspotBaud = 460800;
