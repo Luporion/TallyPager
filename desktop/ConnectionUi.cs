@@ -41,10 +41,10 @@ internal sealed partial class MainWindow
         string mode = SelectedTransport(pagerTransport);
         addresses.Enabled = ssid.Enabled = password.Enabled = mode == "udp";
         gatewayAddress.Enabled = pagerChannel.Enabled = IsEspNow(mode);
-        if (IsEspNow(mode) && activeRadio?.Mode == mode)
+        if (IsEspNow(mode) && activeRadio is { } bridge && Transport.Serves(bridge.Mode, mode))
         {
-            gatewayAddress.Text = activeRadio.Status.RadioAddress;
-            pagerChannel.Value = activeRadio.Status.Channel;
+            gatewayAddress.Text = bridge.Status.RadioAddress;
+            pagerChannel.Value = bridge.Status.Channel;
         }
     }
 
@@ -62,8 +62,9 @@ internal sealed partial class MainWindow
         Full(setupBase, Buttons(Action("Firmware lesen", async (_, _) => await InspectUsb(basePort, baseFirmware))));
         Full(setupBase, baseFirmware);
         Row(setupBase, "Funkmodus", baseTransport);
-        Row(setupBase, "ESP-NOW-Kanal", baseChannel);
-        baseTransport.SelectedIndexChanged += (_, _) => baseChannel.Enabled = IsEspNow(SelectedTransport(baseTransport));
+        Row(setupBase, "Funkkanal", baseChannel);
+        baseTransport.SelectedIndexChanged += (_, _) =>
+            baseChannel.Enabled = IsEspNow(SelectedTransport(baseTransport)) || Transport.Serves(SelectedTransport(baseTransport), Transport.Hotspot);
         baseTransport.SelectedIndex = 0;
         baseLink = Action("Funkbasis verbinden", async (_, _) => await ConnectBase());
         restorePager = Action("Wieder als Pager starten", async (_, _) => await ConfigureBase(true));
@@ -76,8 +77,8 @@ internal sealed partial class MainWindow
         Full(setupBase, new Label
         {
             AutoSize = true, MaximumSize = new Size(700, 0),
-            Text = "ESP8266MOD mit 4 MB Flash · ESP-NOW per USB. Am Pager denselben Kanal und die Adresse der Funkbasis eintragen. " +
-                "Für BLE ist der Windows-Bluetooth-Adapter eine weitere Möglichkeit."
+            Text = "ESP8266MOD mit 4 MB Flash. Nach dem Flashen stehen oben ESP-NOW, WLAN-Brücke und beide zusammen zur Wahl. " +
+                "Mit WLAN-Brücke Kanal 1, 6 oder 11 wählen. Im Kombimodus verwenden beide Funkwege diesen Kanal."
         });
         AddWindowsBluetoothControls(setupBase);
     }
@@ -108,10 +109,10 @@ internal sealed partial class MainWindow
             var status = await Task.Run(() => PagerUsb.ReadStatus(port, TimeSpan.FromSeconds(8)));
             if (status.Board != "esp8266" || status.Version != PagerUsb.Version || !RadioBridge.CanConnect(status))
                 throw new InvalidOperationException("Die ESP8266-Funkbasis hat den Neustart nicht bestätigt.");
-            if (status.Channel != channel)
+            if (status.Mode == "espnow" && status.Channel != channel)
                 status = await Task.Run(() => PagerUsb.ConfigureBase(port, status.Id, "espnow", channel));
             ShowUsbFirmware(status, baseFirmware);
-            baseStatus.Text = $"ESP8266 bereit · Adresse {Transport.DisplayAddress(status.RadioAddress)} · Kanal {status.Channel}. Jetzt Funkbasis verbinden.";
+            baseStatus.Text = "ESP8266 installiert. Oben Funkmodus und Kanal wählen, einrichten und verbinden.";
         }
         catch (Exception error) { baseStatus.Text = error.Message; }
         finally { busy = false; }
@@ -167,6 +168,7 @@ internal sealed partial class MainWindow
         {
             ShowBaseModes(status);
             ShowHotspot(status);
+            if (status.BaseRole && status.Channel is >= 1 and <= 13) baseChannel.Value = status.Channel;
         }
         if (status.Firmware is { Older: true })
             label.Text += "\nFirmware-Update kann separat gestartet werden.";
@@ -175,13 +177,15 @@ internal sealed partial class MainWindow
     private void ShowBaseModes(UsbStatus? status)
     {
         string previous = SelectedTransport(baseTransport);
-        string[] modes = new[] { "espnow", "espnow-lr", "ble" }
+        string[] possible = status?.Board == "esp8266" ? ["espnow", Transport.Hotspot, Transport.Hybrid] :
+            ["espnow", "espnow-lr", "ble"];
+        string[] modes = possible
             .Where(mode => status is null || status.Firmware?.AllowsBase(mode) == true).ToArray();
         baseTransport.Items.Clear();
         baseTransport.Items.AddRange(modes.Select(mode => new ModeChoice(mode)).ToArray());
         baseTransport.Enabled = modes.Length > 0;
         if (modes.Length > 0)
-            baseTransport.SelectedIndex = Math.Max(0, Array.IndexOf(modes, previous));
+            baseTransport.SelectedIndex = Math.Max(0, Array.IndexOf(modes, status is { BaseRole: true } ? status.Mode : previous));
         if (restorePager is not null)
             restorePager.Enabled = status is null || (status.Board == "m5stick-cplus2" &&
                 status.Firmware?.Supports(FirmwareInfo.RadioBase) == true);
@@ -277,9 +281,10 @@ internal sealed partial class MainWindow
             baseLink!.Text = "Funkbasis trennen";
             var baseInfo = activeRadio.Status;
             ShowUsbFirmware(baseInfo, baseFirmware);
-            baseStatus.Text = baseInfo.Mode == Transport.Hotspot ? $"{port} · WLAN-Brücke verbunden · {baseInfo.HotspotSsid}" :
-                $"{port} · {Transport.Name(baseInfo.Mode)} · Adresse {baseInfo.RadioAddress}" +
-                (IsEspNow(baseInfo.Mode) ? $" · Kanal {baseInfo.Channel}" : "");
+            baseStatus.Text = $"{port} · {Transport.Name(baseInfo.Mode)} verbunden" +
+                (Transport.Serves(baseInfo.Mode, Transport.Hotspot) ? $" · {baseInfo.HotspotSsid}" : "") +
+                (baseInfo.RadioAddress.Length != 0 ? $" · Funkadresse {Transport.DisplayAddress(baseInfo.RadioAddress)}" : "") +
+                (baseInfo.Mode != "ble" ? $" · Kanal {baseInfo.Channel}" : "");
             core.Diagnostics.Add("USB-Funkbasis", "Basis verbunden", Transport.Name(baseInfo.Mode));
             UpdateProvisionFields();
         }
@@ -318,7 +323,7 @@ internal sealed partial class MainWindow
                 PagerUsb.ConfigureBase(port, current.Id, mode, channel));
             ShowUsbFirmware(status, baseFirmware);
             baseStatus.Text = restore ? $"Pager im Modus {Transport.Name(status.Mode)} gestartet." :
-                $"Funkbasis bereit · Adresse {status.RadioAddress}. Jetzt Funkbasis verbinden.";
+                $"{Transport.Name(status.Mode)} bereit. Jetzt Funkbasis verbinden.";
         }
         catch (Exception error) { baseStatus.Text = error.Message; }
         finally { busy = false; }

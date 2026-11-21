@@ -3,16 +3,12 @@
 #include <M5StickCPlus2.h>
 #include <Preferences.h>
 #include <WiFi.h>
-#include <WiFiUdp.h>
+#include "hotspot_link.h"
 #include <esp_system.h>
 
 namespace {
-constexpr uint16_t tallyPort = 46224;
-constexpr size_t packetLimit = 900;
-constexpr size_t envelopeSize = 21;
-constexpr int maxClients = 4;
-const IPAddress gateway(192, 168, 4, 1), mask(255, 255, 255, 0);
-WiFiUDP traffic;
+using namespace hotspot;
+Link traffic;
 String deviceId, ssid, password;
 int channel = 6;
 bool ready = false;
@@ -20,19 +16,6 @@ char line[envelopeSize + packetLimit + 1];
 size_t used = 0;
 bool overflow = false;
 uint32_t restartAt = 0;
-
-bool validChannel(int value) { return value == 1 || value == 6 || value == 11; }
-
-bool clientAddress(const IPAddress& ip) {
-  return ip[0] == gateway[0] && ip[1] == gateway[1] && ip[2] == gateway[2] && ip[3] >= 2 && ip[3] <= 254;
-}
-
-bool tallyPayload(const char* bytes, size_t length) {
-  if (length < 4 || length > packetLimit || memcmp(bytes, "TP1|", 4) != 0) return false;
-  for (size_t i = 4; i < length; ++i)
-    if (bytes[i] < ' ' || bytes[i] > '~') return false;
-  return true;
-}
 
 bool loadSettings() {
   Preferences prefs;
@@ -97,21 +80,7 @@ void command() {
     restartAt = millis() + 350;
     return;
   }
-  if (!ready || used <= envelopeSize || strncmp(line, "TP LINK ", 8) != 0 || line[20] != ' ' ||
-      !tallyPayload(line + envelopeSize, used - envelopeSize)) return;
-  uint8_t bytes[6]{};
-  for (size_t i = 0; i < 12; ++i) {
-    char ch = line[8 + i];
-    int digit = ch >= '0' && ch <= '9' ? ch - '0' : ch >= 'a' && ch <= 'f' ? ch - 'a' + 10 : -1;
-    if (digit < 0) return;
-    bytes[i / 2] = (bytes[i / 2] << 4) | digit;
-  }
-  const IPAddress ip(bytes[0], bytes[1], bytes[2], bytes[3]);
-  const uint16_t port = (bytes[4] << 8) | bytes[5];
-  if (clientAddress(ip) && port && traffic.beginPacket(ip, port)) {
-    traffic.write(reinterpret_cast<const uint8_t*>(line + envelopeSize), used - envelopeSize);
-    traffic.endPacket();
-  }
+  if (ready) traffic.fromSerial(line, used, linkPrefix);
 }
 
 void readSerial() {
@@ -124,23 +93,6 @@ void readSerial() {
       overflow = false;
     } else if (ch < ' ' || ch > '~' || used == sizeof(line) - 1) overflow = true;
     else if (!overflow) line[used++] = ch;
-  }
-}
-
-void readNetwork() {
-  char packet[packetLimit];
-  for (int i = 0; i < 4; ++i) {
-    int size = traffic.parsePacket();
-    if (size <= 0) return;
-    IPAddress ip = traffic.remoteIP();
-    uint16_t port = traffic.remotePort();
-    if (size > static_cast<int>(sizeof(packet)) || !clientAddress(ip) || !port) { traffic.flush(); continue; }
-    if (traffic.read(reinterpret_cast<uint8_t*>(packet), size) != size || !tallyPayload(packet, size)) continue;
-    char header[envelopeSize + 1];
-    snprintf(header, sizeof(header), "TP LINK %02x%02x%02x%02x%04x ", ip[0], ip[1], ip[2], ip[3], port);
-    Serial.write(reinterpret_cast<const uint8_t*>(header), envelopeSize);
-    Serial.write(reinterpret_cast<const uint8_t*>(packet), size);
-    Serial.write('\n');
   }
 }
 
@@ -176,13 +128,13 @@ void setup() {
   WiFi.persistent(false);
   WiFi.setAutoReconnect(false);
   ready = loadSettings() && WiFi.mode(WIFI_AP) && WiFi.softAPConfig(gateway, gateway, mask) &&
-      WiFi.softAP(ssid.c_str(), password.c_str(), channel, 0, maxClients) && traffic.begin(gateway, tallyPort);
+      WiFi.softAP(ssid.c_str(), password.c_str(), channel, 0, maxClients) && traffic.begin();
   if (!ready) WiFi.mode(WIFI_OFF);
 }
 
 void loop() {
   readSerial();
-  if (ready) readNetwork();
+  if (ready) traffic.toSerial(linkPrefix);
   static int previousClients = -1;
   static uint32_t checkedAt = 0;
   uint32_t now = millis();

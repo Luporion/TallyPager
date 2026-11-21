@@ -73,9 +73,10 @@ internal sealed class PilotCore : IDisposable
     private IRadioBridge? bluetooth;
     private long lastBroadcast;
 
-    private sealed record Peer(IPEndPoint? Ip, IRadioBridge? Bridge = null, string? Address = null)
+    private sealed record Peer(IPEndPoint? Ip, IRadioBridge? Bridge = null, string? Address = null, string? TransportRoute = null)
     {
-        public IPAddress? WifiAddress => Ip?.Address ?? (Bridge?.Mode == Transport.Hotspot ? Transport.HotspotAddress(Address) : null);
+        public string Mode => TransportRoute ?? Bridge?.Mode ?? "udp";
+        public IPAddress? WifiAddress => Ip?.Address ?? (Mode == Transport.Hotspot ? Transport.HotspotAddress(Address) : null);
     }
     private sealed record Offer(Peer Endpoint, string Nonce, string Session, long Expires);
     private sealed record ManagedPeer(IPEndPoint Endpoint, string Session, long Expires)
@@ -322,8 +323,12 @@ internal sealed class PilotCore : IDisposable
     {
         if (bridge is null) return;
         for (int i = 0; i < 24 && bridge.TryRead(out var packet); i++)
-            if (packet.Payload.Length <= 900 && Transport.ValidEndpoint(bridge.Mode, packet.Address))
-                Handle(new(null, bridge, packet.Address), packet.Payload);
+        {
+            string route = packet.Transport ?? bridge.Mode;
+            if (packet.Payload.Length <= 900 && route != Transport.Hybrid && Transport.Serves(bridge.Mode, route) &&
+                Transport.ValidEndpoint(route, packet.Address))
+                Handle(new(null, bridge, packet.Address, packet.Transport), packet.Payload);
+        }
     }
 
     public void AttachRadio(IRadioBridge? bridge) => ReplaceBridge(ref radio, bridge);
@@ -543,7 +548,7 @@ internal sealed class PilotCore : IDisposable
             link.LastAddress = source.WifiAddress?.ToString() ?? Transport.DisplayAddress(source.Address);
             link.ConfigCounter = 0;
             link.DisplayCounter = 0;
-            link.Transport = source.Bridge?.Mode ?? "udp";
+            link.Transport = source.Mode;
             link.HandshakeAt = now;
             link.ClockAt = -60000;
             link.SeenAt = -6000;
@@ -692,7 +697,7 @@ internal sealed class PilotCore : IDisposable
     {
         string packet = body + "|" + Convert.ToHexStringLower(Signature(link.Pager.Key, body));
         if (endpoint.Ip is { } ip) return udp.Send(Encoding.ASCII.GetBytes(packet), ip) > 0;
-        return endpoint.Bridge is { } bridge && endpoint.Address is { } address && bridge.Send(address, packet);
+        return endpoint.Bridge is { } bridge && endpoint.Address is { } address && bridge.Send(address, packet, endpoint.TransportRoute);
     }
 
     private static byte[] Signature(string key, string body) =>

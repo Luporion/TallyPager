@@ -11,10 +11,9 @@ internal sealed partial class MainWindow
 
     private void AddHotspotSetup(TableLayoutPanel parent)
     {
-        var grid = SetupSection(parent, "WLAN-Brücke · M5StickC Plus2");
-        SetupHint(grid, "Einen M5Stick am oben gewählten USB-Port als Hotspot einrichten. " +
-            "Die Pager verwenden WLAN + UDP und als Basis-Server 192.168.4.1. Bis zu vier WLAN-Geräte können sich anmelden.");
-        Full(grid, Buttons(Action("Brücken-Firmware flashen", async (_, _) => await FlashHotspot())));
+        var grid = SetupSection(parent, "WLAN-Brücke");
+        SetupHint(grid, "Kamera-Pager verwenden WLAN + UDP und den Basis-Server 192.168.4.1. Bis zu vier WLAN-Geräte können sich anmelden.");
+        Full(grid, Buttons(Action("M5Stick-Brücken-Firmware flashen", async (_, _) => await FlashHotspot())));
         Row(grid, "WLAN-Name", hotspotName);
         Row(grid, "WLAN-Passwort", hotspotPassword, Reveal(hotspotPassword));
         hotspotChannel.Items.AddRange([1, 6, 11]);
@@ -29,7 +28,7 @@ internal sealed partial class MainWindow
 
     private void ShowHotspot(UsbStatus? status)
     {
-        hotspotInfo = status is { Mode: Transport.Hotspot } ? status : null;
+        hotspotInfo = Transport.Serves(status?.Mode, Transport.Hotspot) ? status : null;
         hotspotName.Text = hotspotInfo?.HotspotSsid ?? "";
         hotspotPassword.Text = hotspotInfo?.HotspotPassword ?? "";
         hotspotChannel.SelectedItem = hotspotInfo?.Channel ?? 6;
@@ -95,14 +94,17 @@ internal sealed partial class MainWindow
         if (busy || changingModes || hotspotInfo is not { } status || basePort.SelectedItem is not string port ||
             hotspotChannel.SelectedItem is not int channel || status.Channel == channel) return;
         bool reconnect = activeRadio?.Port == port;
-        if (MessageBox.Show(this, "Beim Kanalwechsel startet der Hotspot neu. Kanal jetzt wechseln?",
+        if (MessageBox.Show(this, status.Mode == Transport.Hybrid ?
+                "Der Kanalwechsel startet die Basis neu. Die ESP-NOW-Pager brauchen danach denselben neuen Kanal." :
+                "Beim Kanalwechsel startet der Hotspot neu. Kanal jetzt wechseln?",
             "WLAN-Kanal wechseln", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
         busy = true;
         basePort.Enabled = false;
         try
         {
             if (reconnect) DisconnectBase("WLAN-Kanal wird gewechselt …");
-            var updated = await Task.Run(() => PagerUsb.ConfigureHotspotChannel(port, status.Id, channel));
+            var updated = await Task.Run(() => status.Board == "esp8266" ?
+                PagerUsb.ConfigureBase(port, status.Id, status.Mode, channel) : PagerUsb.ConfigureHotspotChannel(port, status.Id, channel));
             ShowUsbFirmware(updated, baseFirmware);
         }
         catch (Exception error) { hotspotStatus.Text = error.Message; }

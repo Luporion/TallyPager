@@ -70,8 +70,9 @@ internal static class RegieCheck
         foreach (string mode in expectedRadio.Order(StringComparer.Ordinal))
         {
             string label = Transport.Name(mode);
-            checks.Add(new(bridgeMode == mode ? CheckResult.Ready : CheckResult.Problem, "USB-Funkbasis",
-                bridgeMode == mode ? $"{label} · verbunden" : bridgeMode is null ? $"{label} · Basis fehlt." :
+            bool available = Transport.Serves(bridgeMode, mode);
+            checks.Add(new(available ? CheckResult.Ready : CheckResult.Problem, "USB-Funkbasis",
+                available ? $"{label} · verbunden" : bridgeMode is null ? $"{label} · Basis fehlt." :
                 $"{label} wird erwartet. Die Basis läuft mit {Transport.Name(bridgeMode)}."));
         }
         if (expectedRadio.Count == 0 && bridgeMode is not null)

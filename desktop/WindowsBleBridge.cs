@@ -144,7 +144,7 @@ internal sealed class WindowsBleBridge : IRadioBridge
     }
 
     public bool TryRead(out RadioPacket packet) => inbound.Reader.TryRead(out packet);
-    public bool Send(string address, string payload) => !closed && peers.TryGetValue(address, out var peer) &&
+    public bool Send(string address, string payload, string? transport = null) => !closed && peers.TryGetValue(address, out var peer) &&
         peer.Ready && peer.Outbound.Writer.TryWrite(payload);
 
     public void Dispose()

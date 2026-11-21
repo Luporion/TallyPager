@@ -96,7 +96,7 @@ internal sealed partial class MainWindow
     {
         if (slot.Mode == "udp") return null;
         if (slot.Mode == "ble" && windowsBluetooth is { Failure: null }) return null;
-        if (activeRadio is not { Failure: null } usb || usb.Mode != slot.Mode)
+        if (activeRadio is not { Failure: null } usb || !Transport.Serves(usb.Mode, slot.Mode))
             return $"Funkbasis für {Transport.Name(slot.Mode)} verbinden.";
         if (IsEspNow(slot.Mode) && (usb.Status.RadioAddress != slot.Gateway || usb.Status.Channel != slot.Channel))
             return $"Das Zielprofil erwartet die Basis {Transport.DisplayAddress(slot.Gateway)} auf Kanal {slot.Channel}.";

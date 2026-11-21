@@ -7,13 +7,14 @@ internal interface IRadioBridge : IDisposable
 {
     string Mode { get; }
     bool TryRead(out RadioPacket packet);
-    bool Send(string address, string payload);
+    bool Send(string address, string payload, string? transport = null);
 }
-internal readonly record struct RadioPacket(string Address, string Payload);
+internal readonly record struct RadioPacket(string Address, string Payload, string? Transport = null);
 
 internal sealed class RadioBridge : IRadioBridge
 {
     private const string Prefix = "TP LINK ";
+    private const string WifiPrefix = "TP WIFI ";
     private readonly SerialPort serial;
     private readonly Channel<RadioPacket> inbound = Channel.CreateBounded<RadioPacket>(64);
     private readonly Channel<string> outbound = Channel.CreateBounded<string>(24);
@@ -49,8 +50,15 @@ internal sealed class RadioBridge : IRadioBridge
         status.Firmware?.AllowsBase(status.Mode) == true;
 
     public bool TryRead(out RadioPacket packet) => inbound.Reader.TryRead(out packet);
-    public bool Send(string address, string payload) => !closed && failure is null &&
-        outbound.Writer.TryWrite(Prefix + address + " " + payload);
+    public bool Send(string address, string payload, string? transport = null) => !closed && failure is null &&
+        Format(Mode, address, payload, transport) is { } frame && outbound.Writer.TryWrite(frame);
+
+    internal static string? Format(string mode, string address, string payload, string? transport)
+    {
+        string route = transport ?? mode;
+        if (route == Transport.Hybrid || !Transport.Serves(mode, route) || !Transport.ValidEndpoint(route, address)) return null;
+        return (mode == Transport.Hybrid && route == Transport.Hotspot ? WifiPrefix : Prefix) + address + " " + payload;
+    }
 
     public void SendBaseView(PagerStatus[] pagers)
     {
@@ -123,10 +131,16 @@ internal sealed class RadioBridge : IRadioBridge
         finally { serial.Dispose(); }
     }
 
-    internal static RadioPacket? Parse(string line, string mode = "espnow") =>
-        line.Length is > 21 and <= 921 && line.StartsWith(Prefix, StringComparison.Ordinal) &&
-        line[20] == ' ' && Transport.ValidEndpoint(mode, line[8..20]) && line.AsSpan(21).StartsWith("TP1|", StringComparison.Ordinal)
-        ? new(line[8..20], line[21..]) : null;
+    internal static RadioPacket? Parse(string line, string mode = "espnow")
+    {
+        if (line.Length is <= 21 or > 921 || line[20] != ' ' || !line.AsSpan(21).StartsWith("TP1|", StringComparison.Ordinal)) return null;
+        string? route = mode == Transport.Hybrid ?
+            (line.StartsWith(WifiPrefix, StringComparison.Ordinal) ? Transport.Hotspot :
+                line.StartsWith(Prefix, StringComparison.Ordinal) ? "espnow" : null) :
+            line.StartsWith(Prefix, StringComparison.Ordinal) ? mode : null;
+        return route is not null && Transport.ValidEndpoint(route, line[8..20])
+            ? new(line[8..20], line[21..], mode == Transport.Hybrid ? route : null) : null;
+    }
 
     public void Dispose() { closed = true; serial.Dispose(); }
 }
@@ -134,7 +148,10 @@ internal sealed class RadioBridge : IRadioBridge
 internal static class Transport
 {
     public const string Hotspot = "hotspot";
+    public const string Hybrid = "espnow-hotspot";
     public const string HotspotIp = "192.168.4.1";
+    public static bool Serves(string? baseMode, string transport) => baseMode == transport ||
+        baseMode == Hybrid && transport is Hotspot or "espnow";
     public static string PagerMode(string transport) => transport == Hotspot ? "udp" : transport;
     public static bool ValidEndpoint(string mode, string address) => mode == Hotspot ? HotspotAddress(address) is not null : IsMac(address);
     public static System.Net.IPAddress? HotspotAddress(string? address)
@@ -156,6 +173,7 @@ internal static class Transport
         "02468ace".Contains(address[1]) && address != "000000000000";
     public static string Name(string mode) => mode switch
     {
-        "espnow" => "ESP-NOW", "espnow-lr" => "ESP-NOW LR", "ble" => "BLE", Hotspot => "WLAN-Brücke", _ => "WLAN + UDP"
+        "espnow" => "ESP-NOW", "espnow-lr" => "ESP-NOW LR", "ble" => "BLE", Hotspot => "WLAN-Brücke",
+        Hybrid => "WLAN-Brücke + ESP-NOW", _ => "WLAN + UDP"
     };
 }

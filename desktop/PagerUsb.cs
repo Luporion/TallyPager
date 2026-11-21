@@ -28,7 +28,7 @@ internal enum FirmwareTarget { Pager, Esp8266, Hotspot }
 
 internal static class PagerUsb
 {
-    public const string Version = "0.11.0";
+    public const string Version = "0.12.0";
     public const string FirmwareFileName = "TallyPager-Firmware-M5StickC-Plus2-" + Version + ".zip";
     public const string Esp8266FirmwareFileName = "TallyPager-Firmware-ESP8266-" + Version + ".zip";
     public const string HotspotFirmwareFileName = "TallyPager-Firmware-WLAN-Bruecke-M5StickC-Plus2-" + Version + ".zip";
@@ -124,6 +124,8 @@ internal static class PagerUsb
 
     public static UsbStatus ConfigureBase(string port, string id, string mode, int channel)
     {
+        if (Transport.Serves(mode, Transport.Hotspot) && channel is not (1 or 6 or 11))
+            throw new ArgumentException("Für die WLAN-Brücke Kanal 1, 6 oder 11 wählen.");
         return SetRole(port, id, status => status.Firmware?.AllowsBase(mode) == true,
             "TP BASE " + JsonSerializer.Serialize(new { mode, channel }, Json),
             status => status.BaseRole && status.RadioReady && status.Mode == mode && status.Channel == channel);

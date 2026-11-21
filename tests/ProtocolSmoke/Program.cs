@@ -73,6 +73,7 @@ try
     TestFirmwareCompatibility(settings);
     TestRadioBridge(settings);
     await TestHotspotBridge(settings);
+    TestHybridBridge(settings);
     TestBasePreview(settings);
     await TestRemoteSlots(settings);
     TestRadioFragments();
@@ -816,6 +817,69 @@ static async Task TestHotspotBridge(string settings)
     Console.WriteLine("PASS hotspot IP/port routing, older pager, Tally and Chat, settings, and parallel PC networking");
 }
 
+static void TestHybridBridge(string settings)
+{
+    const string endpoint = "c0a80402abe1", mac = "10061c286f4c", nonce = "0123456789abcdef0123456789abcdef";
+    const string hybrid = Transport.Hybrid, hotspot = Transport.Hotspot;
+    Check(RadioBridge.Parse($"TP WIFI {endpoint} TP1|hello", hybrid) is { Transport: hotspot } &&
+        RadioBridge.Parse($"TP LINK {mac} TP1|hello", hybrid) is { Transport: "espnow" } &&
+        RadioBridge.Parse($"TP WIFI {endpoint} TP1|hello", "espnow") is null &&
+        RadioBridge.Format(hybrid, endpoint, "TP1|test", hotspot) == $"TP WIFI {endpoint} TP1|test" &&
+        RadioBridge.Format(hybrid, mac, "TP1|test", "espnow") == $"TP LINK {mac} TP1|test" &&
+        RadioBridge.Format(hybrid, mac, "TP1|test", null) is null,
+        "A dual-mode USB link must use a distinct envelope for each transport");
+    var status = PagerUsb.ParseStatus($$"""TP {"version":"{{PagerUsb.Version}}","id":"10061c286f4c","board":"esp8266","baseRole":true,"mode":"espnow-hotspot","radioReady":true,"radioAddress":"10061c286f4d","ip":"192.168.4.1","features":["radio-base","espnow","hotspot","espnow-hotspot"]}""");
+    Check(status is { Board: "esp8266", Firmware: { } firmware } && RadioBridge.CanConnect(status) &&
+        firmware.AllowsBase("espnow") && firmware.AllowsBase(hotspot) && !firmware.AllowsBase("espnow-lr"),
+        "The ESP8266 must advertise the three supported base modes only");
+
+    string configuration = Path.Combine(settings, "devices.json");
+    string original = File.ReadAllText(configuration);
+    try
+    {
+        using var core = new PilotCore(settings, 0);
+        var wifi = core.Devices.Single();
+        var radio = core.Prepare("123456789abe", "ESP-NOW-Stick");
+        core.Save(radio);
+        var bridge = new FakeRadio(hybrid);
+        core.AttachRadio(bridge);
+
+        void Push(Pager device, string route, string address, string body) =>
+            bridge.Inbound.Enqueue(new(address, body + "|" + Tag(body, device.Key), route));
+        void ConnectRelay(Pager device, string route, string address, int battery)
+        {
+            Push(device, route, address, $"TP1|hello|{device.Id}|{nonce}");
+            core.Tick();
+            var offer = bridge.Outbound.Last(packet => packet.Payload.Contains($"|offer|{device.Id}|"));
+            Check(offer.Transport == route && offer.Address == address, "Offer must use the incoming relay route");
+            string session = offer.Payload.Split('|')[4];
+            if (route == hotspot)
+            {
+                Push(device, "espnow", address, $"TP1|ready|{device.Id}|{nonce}|{session}");
+                core.Tick();
+                Check(!bridge.Outbound.Any(packet => packet.Payload.Contains($"|state|{device.Id}|")),
+                    "The same endpoint bytes on another transport must not claim the session");
+            }
+            Push(device, route, address, $"TP1|ready|{device.Id}|{nonce}|{session}");
+            core.Tick();
+            Push(device, route, address, $"TP1|seen|{device.Id}|{session}|1|{battery}");
+            core.Tick();
+        }
+        ConnectRelay(wifi, hotspot, endpoint, 76);
+        ConnectRelay(radio, "espnow", mac, 83);
+        Check(core.Statuses().Single(p => p.Id == wifi.Id) is { Online: true, Address: "192.168.4.2", Transport: hotspot, Battery: 76 } &&
+            core.Statuses().Single(p => p.Id == radio.Id) is { Online: true, Address: "10:06:1C:28:6F:4C", Transport: "espnow", Battery: 83 },
+            "Both pagers must be independently visible through one USB bridge");
+        bridge.Outbound.Clear();
+        core.SetPreview(wifi.Id, new(3, 1, "WLAN", ""));
+        core.SetPreview(radio.Id, new(1, 3, "ESP-NOW", ""));
+        Check(bridge.Outbound is [{ Transport: hotspot, Address: endpoint }, { Transport: "espnow", Address: mac }],
+            "Outgoing tally and chat must retain the original route of each pager");
+    }
+    finally { File.WriteAllText(configuration, original); }
+    Console.WriteLine("PASS dual ESP8266 bridge advertisement, envelopes, route isolation and concurrent pagers");
+}
+
 static async Task TestWifiManagement(string settings)
 {
     using var core = new PilotCore(settings, port: 0);
@@ -1178,7 +1242,11 @@ file sealed class FakeRadio(string mode) : IRadioBridge
     public List<RadioPacket> Outbound { get; } = [];
     public bool Closed { get; private set; }
     public bool TryRead(out RadioPacket packet) => Inbound.TryDequeue(out packet);
-    public bool Send(string address, string payload) { Outbound.Add(new(address, payload)); return true; }
+    public bool Send(string address, string payload, string? transport = null)
+    {
+        Outbound.Add(new(address, payload, transport));
+        return true;
+    }
     public void Dispose() => Closed = true;
 }
 
