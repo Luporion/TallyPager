@@ -30,12 +30,77 @@ internal sealed class GitHubUpdates(HttpClient client)
 
     internal static Version ReleaseVersion(GitHubRelease release)
     {
+        return StableVersion(release) ??
+            throw new InvalidDataException("GitHub meldet keinen stabilen TallyPager-Release mit einer gültigen Versionsnummer.");
+    }
+
+    private static Version? StableVersion(GitHubRelease release)
+    {
         if (release.Draft || release.Prerelease || release.Tag is null || !release.Tag.StartsWith('v') ||
             !Version.TryParse(release.Tag[1..], out var version) || version.Build < 0 || version.Revision >= 0 ||
-            release.Tag != $"v{version}")
-            throw new InvalidDataException("GitHub meldet keinen stabilen TallyPager-Release mit einer gültigen Versionsnummer.");
+            release.Tag != $"v{version}") return null;
         return version;
     }
+
+    public async Task<FirmwareChoice[]> ListFirmware(CancellationToken cancel)
+    {
+        var result = new List<FirmwareChoice>();
+        const int pageSize = 100;
+        for (int page = 1; ; page++)
+        {
+            using var request = Request(new(Api.TrimEnd('/') + $"?per_page={pageSize}&page={page}"), binary: false);
+            using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancel);
+            response.EnsureSuccessStatusCode();
+            using var data = new MemoryStream();
+            await Transfer(response, data, maximum: 8_000_000, expected: null, cancel);
+            data.Position = 0;
+            var releases = JsonSerializer.Deserialize<GitHubRelease[]>(data, Json) ??
+                throw new InvalidDataException("GitHub hat keine Release-Liste geliefert.");
+            foreach (var release in releases)
+            {
+                if (release is null || StableVersion(release) is not { } version) continue;
+                foreach (var target in Enum.GetValues<FirmwareTarget>())
+                {
+                    string name = FirmwareCatalog.FileName(target, version);
+                    var assets = release.Assets ?? [];
+                    if (FindAsset(assets, name, FirmwareLimit(target)) is not { } asset) continue;
+                    if (asset.Digest is { Length: > 0 } digest
+                        ? digest.StartsWith("sha256:", StringComparison.Ordinal) && ValidHash(digest[7..])
+                        : FindAsset(assets, name + ".sha256", 1024) is not null)
+                        result.Add(new(target, version, Release: release));
+                }
+            }
+            if (releases.Length < pageSize) return result.ToArray();
+        }
+    }
+
+    public async Task<string> DownloadFirmware(FirmwareChoice choice, string cache, CancellationToken cancel)
+    {
+        if (choice.Release is not { } release || ReleaseVersion(release) != choice.Version)
+            throw new InvalidDataException("Die gewählte Firmware passt nicht zum GitHub-Release.");
+        string name = FirmwareCatalog.FileName(choice.Target, choice.Version);
+        var asset = RequireAsset(release, name, FirmwareLimit(choice.Target));
+        string expected = await ExpectedHash(release, asset, cancel);
+        Directory.CreateDirectory(cache);
+        string destination = Path.Combine(cache, name);
+        if (HashMatches(destination, expected))
+        {
+            PagerUsb.LoadFirmware(destination, null, choice.Version.ToString(), choice.Target);
+            return destination;
+        }
+        string temporary = Path.Combine(cache, Guid.NewGuid().ToString("N") + ".tmp");
+        try
+        {
+            await DownloadFile(release.Tag, asset, expected, temporary, cancel);
+            PagerUsb.LoadFirmware(temporary, null, choice.Version.ToString(), choice.Target);
+            cancel.ThrowIfCancellationRequested();
+            File.Move(temporary, destination, overwrite: true);
+            return destination;
+        }
+        finally { File.Delete(temporary); }
+    }
+
+    private static int FirmwareLimit(FirmwareTarget target) => target == FirmwareTarget.Esp8266 ? 2_000_000 : 15_000_000;
 
     public async Task<GitHubRelease> Check(CancellationToken cancel)
     {
@@ -150,11 +215,13 @@ internal sealed class GitHubUpdates(HttpClient client)
 
     private static GitHubAsset RequireAsset(GitHubRelease release, string name, long maxSize)
     {
-        var matches = (release.Assets ?? []).Where(item => item?.Name == name).ToArray();
-        if (matches is not [var file] || file.Id <= 0 || file.State != "uploaded" || file.Size <= 0 || file.Size > maxSize)
+        return FindAsset(release.Assets ?? [], name, maxSize) ??
             throw new InvalidDataException($"Das GitHub-Release enthält keine vollständige Datei {name}.");
-        return file;
     }
+
+    private static GitHubAsset? FindAsset(GitHubAsset[] assets, string name, long maxSize) =>
+        assets.Where(item => item?.Name == name).ToArray() is [{ Id: > 0, State: "uploaded", Size: > 0 } file] && file.Size <= maxSize
+            ? file : null;
 
     private async Task<string> ExpectedHash(GitHubRelease release, GitHubAsset asset, CancellationToken cancel)
     {

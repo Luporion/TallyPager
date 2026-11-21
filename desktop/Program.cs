@@ -60,7 +60,6 @@ internal sealed partial class MainWindow : Form
     private readonly TextBox pagerName = new() { Text = "Mobile Kamera", MaxLength = 32 };
     private readonly TextBox ssid = new() { MaxLength = 32, PlaceholderText = "Gespeichertes WLAN verwenden" };
     private readonly TextBox password = new() { UseSystemPasswordChar = true, MaxLength = 64 };
-    private readonly TextBox firmware = new() { ReadOnly = true };
     private readonly TextBox chat = new() { MaxLength = 68 };
     private readonly TextBox next = new() { MaxLength = 38 };
     private readonly TextBox atemHost = new() { PlaceholderText = "ATEM-IP-Adresse" };
@@ -177,8 +176,6 @@ internal sealed partial class MainWindow : Form
         ConnectProfileSources();
         ScanPorts();
         RefreshNetworkFooter();
-        string localFirmware = Path.Combine(AppContext.BaseDirectory, PagerUsb.FirmwareFileName);
-        if (File.Exists(localFirmware)) firmware.Text = localFirmware;
         RefreshRows();
         if (rows.Count == 0) tabs.SelectedTab = setup;
         devices.SelectionChanged += (_, _) => SelectionChanged();
@@ -330,23 +327,14 @@ internal sealed partial class MainWindow : Form
         Full(grid, usbStatus);
         var firmwareSettings = SetupSection(grid, "Firmware");
         Full(firmwareSettings, usbFirmware);
-        Row(firmwareSettings, "Firmwarepaket", firmware, Action("ZIP auswählen", (_, _) => SelectFirmware()));
-        Full(firmwareSettings, Buttons(Action("Firmware aktualisieren", async (_, _) => await UpdateUsbFirmware())));
+        var flashStatus = Notice();
+        Full(firmwareSettings, Buttons(Action("Firmware auswählen …", async (_, _) => await ChooseAndFlash(ports, usbFirmware, flashStatus))));
+        Full(firmwareSettings, flashStatus);
         usbStatus.Text = "Bei leeren WLAN-Feldern verwendet der Stick die gespeicherte Verbindung.";
         pagerTransport.SelectedIndexChanged += (_, _) => UpdateProvisionFields();
         pagerTransport.SelectedIndex = 0;
         AddWifiSetup(wireless);
         method.SelectedIndex = 0;
-    }
-
-    private void SelectFirmware()
-    {
-        using var dialog = new OpenFileDialog
-        {
-            Title = "TallyPager-Firmwarepaket auswählen", Filter = "Firmwarepaket (*.zip)|*.zip",
-            InitialDirectory = AppContext.BaseDirectory, CheckFileExists = true
-        };
-        if (dialog.ShowDialog(this) == DialogResult.OK) firmware.Text = dialog.FileName;
     }
 
     private async Task Provision()

@@ -73,7 +73,8 @@ internal sealed partial class MainWindow
         Full(setupBase, baseStatus);
         AddHotspotSetup(setupBase);
         Heading(setupBase, "ESP8266-Funkbasis");
-        Full(setupBase, Buttons(Action("ESP8266-Firmware flashen", async (_, _) => await FlashEsp8266())));
+        Full(setupBase, Buttons(Action("ESP8266-Firmware auswählen …", async (_, _) =>
+            await ChooseAndFlash(basePort, baseFirmware, baseStatus, FirmwareTarget.Esp8266))));
         Full(setupBase, new Label
         {
             AutoSize = true, MaximumSize = new Size(700, 0),
@@ -81,41 +82,6 @@ internal sealed partial class MainWindow
                 "Mit WLAN-Brücke Kanal 1, 6 oder 11 wählen. Im Kombimodus verwenden beide Funkwege diesen Kanal."
         });
         AddWindowsBluetoothControls(setupBase);
-    }
-
-    private async Task FlashEsp8266()
-    {
-        if (busy || changingModes) return;
-        if (basePort.SelectedItem is not string port || activeRadio?.Port == port)
-        {
-            baseStatus.Text = "Einen freien USB-Port für den ESP8266 auswählen.";
-            return;
-        }
-        string package = Path.Combine(AppContext.BaseDirectory, PagerUsb.Esp8266FirmwareFileName);
-        if (!File.Exists(package))
-        {
-            using var picker = new OpenFileDialog { Title = "ESP8266-Firmwarepaket auswählen", Filter = "Firmwarepaket (*.zip)|*.zip" };
-            if (picker.ShowDialog(this) != DialogResult.OK) return;
-            package = picker.FileName;
-        }
-        if (MessageBox.Show(this, $"Die Funkbasis-Firmware ersetzt das vorhandene Programm auf dem ESP8266 an {port}. Jetzt flashen?",
-                "ESP8266 flashen", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
-        busy = true;
-        try
-        {
-            int channel = (int)baseChannel.Value;
-            baseStatus.Text = "ESP8266 und Flashgröße werden geprüft …";
-            await PagerUsb.Flash(port, package, new Progress<string>(value => baseStatus.Text = value), FirmwareTarget.Esp8266);
-            var status = await Task.Run(() => PagerUsb.ReadStatus(port, TimeSpan.FromSeconds(8)));
-            if (status.Board != "esp8266" || status.Version != PagerUsb.Version || !RadioBridge.CanConnect(status))
-                throw new InvalidOperationException("Die ESP8266-Funkbasis hat den Neustart nicht bestätigt.");
-            if (status.Mode == "espnow" && status.Channel != channel)
-                status = await Task.Run(() => PagerUsb.ConfigureBase(port, status.Id, "espnow", channel));
-            ShowUsbFirmware(status, baseFirmware);
-            baseStatus.Text = "ESP8266 installiert. Oben Funkmodus und Kanal wählen, einrichten und verbinden.";
-        }
-        catch (Exception error) { baseStatus.Text = error.Message; }
-        finally { busy = false; }
     }
 
     private void AddWifiSetup(Control panel)
@@ -212,50 +178,10 @@ internal sealed partial class MainWindow
         catch (TimeoutException)
         {
             label.Text = "Chip und Flashgröße werden gelesen …";
-            try { label.Text = await PagerUsb.IdentifyHardware(port); }
+            try { label.Text = (await PagerUsb.IdentifyHardware(port)).Description; }
             catch (Exception error) { label.Text = error.Message; }
         }
         catch (Exception error) { label.Text = error.Message; }
-        finally { busy = false; }
-    }
-
-    private async Task UpdateUsbFirmware()
-    {
-        if (busy) return;
-        if (ports.SelectedItem is not string port) { usbStatus.Text = "USB-Port auswählen."; return; }
-        if (activeRadio?.Port == port)
-        {
-            usbStatus.Text = "Vor dem Update die USB-Funkbasis trennen.";
-            return;
-        }
-        string package = firmware.Text;
-        if (!File.Exists(package))
-        {
-            usbStatus.Text = "Bitte das Firmwarepaket " + PagerUsb.FirmwareFileName + " auswählen.";
-            return;
-        }
-        busy = true;
-        try
-        {
-            UsbStatus? current = null;
-            try { current = await ReadUsbFirmware(port, usbFirmware); }
-            catch (TimeoutException) { }
-            if (current?.Firmware is { Newer: true })
-            {
-                usbStatus.Text = "Der Stick hat bereits eine neuere Firmware als dieses Paket.";
-                return;
-            }
-            if (MessageBox.Show(this, $"TallyPager {PagerUsb.Version} auf den M5StickC Plus2 an {port} schreiben?",
-                "Firmware aktualisieren", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
-            var progress = new Progress<string>(value => usbStatus.Text = value);
-            await Task.Run(() => PagerUsb.Flash(port, package, progress));
-            var result = await Task.Run(() => PagerUsb.ReadStatus(port, TimeSpan.FromSeconds(8)));
-            if (result.Version != PagerUsb.Version || result.Mode == Transport.Hotspot)
-                throw new InvalidOperationException("Firmwareversion nach Neustart nicht bestätigt.");
-            ShowUsbFirmware(result, usbFirmware);
-            usbStatus.Text = $"Firmware {result.Version} installiert.";
-        }
-        catch (Exception error) { usbStatus.Text = error.Message; }
         finally { busy = false; }
     }
 

@@ -96,11 +96,8 @@ internal sealed partial class MainWindow
                 }
                 location.Text = Path.GetDirectoryName(installed.Executable);
                 if (GitHubUpdates.ReleaseVersion(found) == current)
-                {
-                    firmware.Text = installed.Firmware;
-                    status.Text = "Programm und Firmware geprüft. Das ZIP ist unter Stick einrichten/verwalten ausgewählt.";
-                }
-                else status.Text = "Beide Dateien sind geprüft. Die neue Version kann jetzt gestartet werden.";
+                    status.Text = "Programm und Firmware geprüft. Die Pakete sind in der Firmware-Auswahl verfügbar.";
+                else status.Text = "Programm und Firmware geprüft. Die neue Version kann jetzt gestartet werden.";
             });
         };
         folder.Click += (_, _) =>

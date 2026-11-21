@@ -13,7 +13,8 @@ internal sealed partial class MainWindow
     {
         var grid = SetupSection(parent, "WLAN-Brücke");
         SetupHint(grid, "Kamera-Pager verwenden WLAN + UDP und den Basis-Server 192.168.4.1. Bis zu vier WLAN-Geräte können sich anmelden.");
-        Full(grid, Buttons(Action("M5Stick-Brücken-Firmware flashen", async (_, _) => await FlashHotspot())));
+        Full(grid, Buttons(Action("M5Stick-Brücken-Firmware auswählen …", async (_, _) =>
+            await ChooseAndFlash(basePort, baseFirmware, hotspotStatus, FirmwareTarget.Hotspot))));
         Row(grid, "WLAN-Name", hotspotName);
         Row(grid, "WLAN-Passwort", hotspotPassword, Reveal(hotspotPassword));
         hotspotChannel.Items.AddRange([1, 6, 11]);
@@ -54,39 +55,6 @@ internal sealed partial class MainWindow
         setupMethod.SelectedIndex = 0;
         tabs.SelectedTab = setup;
         usbStatus.Text = "Hotspot-Daten übernommen. USB-Port des Pagers wählen und „Stick einrichten“ drücken.";
-    }
-
-    private async Task FlashHotspot()
-    {
-        if (busy || changingModes) return;
-        if (basePort.SelectedItem is not string port || activeRadio?.Port == port)
-        {
-            hotspotStatus.Text = "Einen freien USB-Port für den Brücken-Stick auswählen.";
-            return;
-        }
-        string package = Path.Combine(AppContext.BaseDirectory, PagerUsb.HotspotFirmwareFileName);
-        if (!File.Exists(package))
-        {
-            using var picker = new OpenFileDialog { Title = "WLAN-Brücken-Firmware auswählen", Filter = "Firmwarepaket (*.zip)|*.zip" };
-            if (picker.ShowDialog(this) != DialogResult.OK) return;
-            package = picker.FileName;
-        }
-        if (MessageBox.Show(this, $"WLAN-Brücken-Firmware auf den M5StickC Plus2 an {port} schreiben?",
-            "WLAN-Brücke flashen", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
-        busy = true;
-        basePort.Enabled = false;
-        try
-        {
-            hotspotStatus.Text = "M5StickC Plus2 wird geprüft …";
-            await PagerUsb.Flash(port, package, new Progress<string>(value => hotspotStatus.Text = value), FirmwareTarget.Hotspot);
-            var status = await Task.Run(() => PagerUsb.ReadStatus(port, TimeSpan.FromSeconds(8)));
-            ShowUsbFirmware(status, baseFirmware);
-            if (status.Version != PagerUsb.Version || status.Mode != Transport.Hotspot || !RadioBridge.CanConnect(status))
-                throw new InvalidOperationException("Der M5Stick hat die betriebsbereite WLAN-Brücke nach dem Neustart nicht bestätigt.");
-            hotspotStatus.Text = "Hotspot läuft. Oben „Funkbasis verbinden“ drücken und anschließend die Daten in die Stick-Einrichtung übernehmen.";
-        }
-        catch (Exception error) { hotspotStatus.Text = error.Message; }
-        finally { basePort.Enabled = true; busy = false; }
     }
 
     private async Task SetHotspotChannel()

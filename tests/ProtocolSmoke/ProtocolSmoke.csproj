@@ -23,6 +23,7 @@
     <Compile Include="../../desktop/TallyArbiterSource.cs" Link="TallyArbiterSource.cs" />
     <Compile Include="../../desktop/PagerUsb.cs" Link="PagerUsb.cs" />
     <Compile Include="../../desktop/FirmwareInfo.cs" Link="FirmwareInfo.cs" />
+    <Compile Include="../../desktop/FirmwareCatalog.cs" Link="FirmwareCatalog.cs" />
     <PackageReference Include="LibAtem" Version="1.0.0" />
     <PackageReference Include="log4net" Version="3.6.0" />
     <PackageReference Include="System.IO.Ports" Version="10.0.9" />

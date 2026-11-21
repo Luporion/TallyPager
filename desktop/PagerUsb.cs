@@ -25,11 +25,11 @@ internal sealed record UsbStatus(string Version, string Id, bool Configured, boo
 internal sealed record UsbSettings(string Id, string Name, string Host, string Ssid, string Password,
     string Mode, string Gateway, int Channel, int Slot);
 internal enum FirmwareTarget { Pager, Esp8266, Hotspot }
+internal sealed record UsbHardware(FirmwareTarget? Target, string Description);
 
 internal static class PagerUsb
 {
-    public const string Version = "0.12.0";
-    public const string FirmwareFileName = "TallyPager-Firmware-M5StickC-Plus2-" + Version + ".zip";
+    public const string Version = "0.13.0";
     public const string Esp8266FirmwareFileName = "TallyPager-Firmware-ESP8266-" + Version + ".zip";
     public const string HotspotFirmwareFileName = "TallyPager-Firmware-WLAN-Bruecke-M5StickC-Plus2-" + Version + ".zip";
     private const int StandardBaud = 115200, HotspotBaud = 460800;
@@ -168,13 +168,13 @@ internal static class PagerUsb
     private static readonly (string Offset, string Name, long Limit)[] Esp8266Images =
         [("0x0", "firmware.bin", 0xff000)];
 
-    public static async Task Flash(string port, string package, IProgress<string> progress, FirmwareTarget target = FirmwareTarget.Pager)
+    public static async Task Flash(string port, string package, IProgress<string> progress, FirmwareTarget target, Version version)
     {
         bool esp8266 = target == FirmwareTarget.Esp8266;
         string directory = Path.Combine(PilotCore.DataDirectory, "bundle", Version, FirmwareBoard(target));
         Directory.CreateDirectory(directory);
         WriteVerifiedResource(directory, "esptool.exe");
-        LoadFirmware(package, directory, target: target);
+        LoadFirmware(package, directory, version.ToString(), target);
         var start = Flasher(directory);
         string[] common = ["--chip", esp8266 ? "esp8266" : "esp32", "--port", port];
         bool correctChip = false;
@@ -197,7 +197,7 @@ internal static class PagerUsb
             });
     }
 
-    public static async Task<string> IdentifyHardware(string port)
+    public static async Task<UsbHardware> IdentifyHardware(string port)
     {
         string directory = Path.Combine(PilotCore.DataDirectory, "bundle", Version, "probe");
         Directory.CreateDirectory(directory);
@@ -211,11 +211,11 @@ internal static class PagerUsb
                 capacity = line["Detected flash size:".Length..].Trim();
         });
         if (chip.StartsWith("ESP8266", StringComparison.Ordinal))
-            return capacity == "4MB" ? "ESP8266MOD · 4 MB Flash\nFirmware verfügbar für ESP-NOW als USB-Funkbasis."
-                : $"ESP8266 · {capacity} Flash\nDas ESP8266-Firmwarepaket benötigt 4 MB.";
+            return capacity == "4MB" ? new(FirmwareTarget.Esp8266, "ESP8266MOD · 4 MB Flash")
+                : new(null, $"ESP8266 · {capacity} Flash\nDas ESP8266-Firmwarepaket benötigt 4 MB.");
         if (chip.StartsWith("ESP32-PICO-V3-02", StringComparison.Ordinal))
-            return "ESP32-PICO-V3-02 · Chip des M5StickC Plus2\nDie TallyPager-Firmware meldet Modell und Funktionen nach dem Start.";
-        return $"Anderes Gerät · {(chip.Length == 0 ? "Chip unbekannt" : chip)}\nFirmwarepakete verfügbar für M5StickC Plus2 und ESP8266 mit 4 MB.";
+            return new(FirmwareTarget.Pager, "M5StickC Plus2 · ESP32-PICO-V3-02");
+        return new(null, $"Anderes Gerät · {(chip.Length == 0 ? "Chip unbekannt" : chip)}\nFirmwarepakete verfügbar für M5StickC Plus2 und ESP8266 mit 4 MB.");
     }
 
     private static ProcessStartInfo Flasher(string directory) => new(Path.Combine(directory, "esptool.exe"))
@@ -231,31 +231,48 @@ internal static class PagerUsb
         _ => "m5stick-cplus2"
     };
 
+    internal static (FirmwareTarget Target, Version Version) InspectFirmware(string path, bool verify = false)
+    {
+        using var zip = ZipFile.OpenRead(path);
+        return ReadFirmware(zip, verify, null);
+    }
+
     internal static void LoadFirmware(string path, string? directory, string expectedVersion = Version, FirmwareTarget target = FirmwareTarget.Pager)
     {
         using var zip = ZipFile.OpenRead(path);
+        ReadFirmware(zip, true, directory, target, expectedVersion);
+    }
+
+    private static (FirmwareTarget Target, Version Version) ReadFirmware(ZipArchive zip, bool verify, string? directory,
+        FirmwareTarget? expectedTarget = null, string? expectedVersion = null)
+    {
         var manifestEntry = zip.GetEntry("manifest.json");
         if (manifestEntry is null || manifestEntry.Length is < 1 or > 4096)
             throw new InvalidDataException("Im Firmwarepaket fehlt das Manifest.");
         using var manifestStream = manifestEntry.Open();
-        var manifest = JsonSerializer.Deserialize<FirmwareManifest>(manifestStream, Json);
-        if (manifest?.Sha256 is null || manifest.Board != FirmwareBoard(target) || manifest.Version != expectedVersion)
+        FirmwareManifest? manifest;
+        try { manifest = JsonSerializer.Deserialize<FirmwareManifest>(manifestStream, Json); }
+        catch (JsonException error) { throw new InvalidDataException("Das Firmware-Manifest ist ungültig.", error); }
+        if (manifest?.Sha256 is null || !System.Version.TryParse(manifest.Version, out var version) ||
+            version.Build < 0 || version.Revision >= 0 || version.ToString() != manifest.Version)
+            throw new InvalidDataException("Das Firmwarepaket hat keine gültige TallyPager-Version.");
+        FirmwareTarget target = manifest.Board switch
         {
-            string purpose = target switch
-            {
-                FirmwareTarget.Hotspot => "die WLAN-Brücke (M5StickC Plus2)",
-                FirmwareTarget.Esp8266 => "die ESP8266-Funkbasis",
-                _ => "den M5StickC Plus2 als Pager oder Funkbasis"
-            };
-            throw new InvalidDataException($"Bitte das Firmwarepaket für {purpose} in Version {expectedVersion} auswählen.");
-        }
-
+            "m5stick-cplus2" => FirmwareTarget.Pager,
+            "m5stick-cplus2-hotspot" => FirmwareTarget.Hotspot,
+            "esp8266" => FirmwareTarget.Esp8266,
+            _ => throw new InvalidDataException("Das Firmwarepaket nennt kein unterstütztes Zielgerät.")
+        };
+        if (expectedTarget is not null && expectedTarget != target || expectedVersion is not null && expectedVersion != manifest.Version)
+            throw new InvalidDataException("Firmwarepaket und ausgewählte Firmware stimmen bei Gerät, Rolle oder Version nicht überein.");
         foreach (var image in target == FirmwareTarget.Esp8266 ? Esp8266Images : Images)
         {
             var entry = zip.GetEntry(image.Name);
             if (entry is null || entry.Length < 1 || entry.Length > image.Limit ||
-                !manifest.Sha256.TryGetValue(image.Name, out string? expected))
+                !manifest.Sha256.TryGetValue(image.Name, out string? expected) || expected is not { Length: 64 } ||
+                !expected.All(Uri.IsHexDigit))
                 throw new InvalidDataException("Fehlendes oder ungültiges Firmware-Image: " + image.Name);
+            if (!verify) continue;
             // Only read the known images. ZIP paths never control the output location.
             using var stream = entry.Open();
             byte[] bytes = new byte[checked((int)entry.Length)];
@@ -265,6 +282,7 @@ internal static class PagerUsb
                 throw new InvalidDataException("Firmware-Prüfsumme stimmt nicht: " + image.Name);
             if (directory is not null) File.WriteAllBytes(Path.Combine(directory, image.Name), bytes);
         }
+        return (target, version);
     }
 
     private static async Task Run(ProcessStartInfo start, string[] arguments, Action<string> output)

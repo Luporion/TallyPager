@@ -92,6 +92,7 @@ try
     await TestVmixWithoutSubscription();
     await TestVmixWeb();
     await TestVmixFailure();
+    await TestFirmwareCatalog(settings);
     using (var atem = new AtemSource("127.0.0.1"))
         Check(atem.State.Inputs.Length == 0, "An ATEM without a source must remain unknown");
     if (args.Length > 0)
@@ -352,6 +353,74 @@ static async Task TestDiagnosticStorage(string settings)
     using var recovered = new DiagnosticLog(path);
     Check(recovered.StorageIssue is null && recovered.Entries.Single().Detail == "Neuer Verlauf", "A new history must recover after bad data");
     Console.WriteLine("PASS bounded diagnostic history, periodic saving, restart, shutdown flush and corrupt-file recovery");
+}
+
+static async Task TestFirmwareCatalog(string settings)
+{
+    string root = Path.Combine(settings, "firmware-catalog");
+    string cache = Path.Combine(root, "cache");
+    var old = new Version(0, 4, 0);
+    var recent = new Version(0, 12, 0);
+    Directory.CreateDirectory(root);
+    try
+    {
+        static void MakePagerZip(string file, Version version)
+        {
+            using var zip = System.IO.Compression.ZipFile.Open(file, System.IO.Compression.ZipArchiveMode.Create);
+            var hashes = new Dictionary<string, string>();
+            foreach (var image in PagerUsb.Images)
+            {
+                byte[] bytes = Encoding.UTF8.GetBytes(image.Name);
+                using var stream = zip.CreateEntry(image.Name).Open();
+                stream.Write(bytes);
+                hashes[image.Name] = Convert.ToHexStringLower(SHA256.HashData(bytes));
+            }
+            using var manifest = zip.CreateEntry("manifest.json").Open();
+            JsonSerializer.Serialize(manifest, new { board = "m5stick-cplus2", version = version.ToString(), sha256 = hashes });
+        }
+
+        string oldName = FirmwareCatalog.FileName(FirmwareTarget.Pager, old);
+        string newName = FirmwareCatalog.FileName(FirmwareTarget.Pager, recent);
+        string archived = Path.Combine(root, oldName);
+        string releaseRoot = Path.Combine(root, "releases");
+        string newFolder = Path.Combine(releaseRoot, "GitHub", recent.ToString());
+        Directory.CreateDirectory(newFolder);
+        MakePagerZip(archived, old);
+        MakePagerZip(Path.Combine(newFolder, newName), recent);
+        var payload = File.ReadAllBytes(archived);
+        var asset = new GitHubAsset(1, oldName, payload.Length, "sha256:" + Convert.ToHexStringLower(SHA256.HashData(payload)), "uploaded");
+        var release = new GitHubRelease($"v{old}", false, false, [asset]);
+        byte[] bad = [1, 2, 3];
+        var broken = new GitHubRelease($"v{recent}", false, false, [asset with { Name = newName, Digest = "invalid" }]);
+        int downloads = 0;
+        using var client = new HttpClient(new FakeHttp(request => request.RequestUri!.Host == "api.github.com"
+            ? new(HttpStatusCode.OK) { Content = new StringContent(JsonSerializer.Serialize(new[] { release, broken, release with { Draft = true } }, ProfileStore.Json)) }
+            : new(HttpStatusCode.OK) { Content = new ByteArrayContent(++downloads == 1 ? bad : payload) }));
+        var updater = new GitHubUpdates(client);
+        var online = await updater.ListFirmware(CancellationToken.None);
+        Check(online is [{ Target: FirmwareTarget.Pager } entry] && entry.Version == old,
+            "Only a stable, verifiable older firmware must appear in the GitHub catalog");
+        var local = FirmwareCatalog.FindLocal(root, cache, releaseRoot);
+        var choices = FirmwareCatalog.ForTarget(FirmwareTarget.Pager, online.Concat(local));
+        Check(choices.Length == 2 && choices[0].Version == recent && choices[1].Version == old && choices.All(item => item.LocalPath is not null),
+            "The default must be newest and duplicate online packages must prefer a verified local copy");
+        Check(FirmwareCatalog.CompatibleTargets(FirmwareTarget.Esp8266).SequenceEqual(new[] { FirmwareTarget.Esp8266 }) &&
+            FirmwareCatalog.ForTarget(FirmwareTarget.Hotspot, choices).Length == 0,
+            "The firmware selector must keep device families and roles separate");
+        try
+        {
+            await updater.DownloadFirmware(online[0], cache, CancellationToken.None);
+            throw new InvalidOperationException("A bad download was accepted");
+        }
+        catch (InvalidDataException) { }
+        Check(!Directory.EnumerateFileSystemEntries(cache).Any(), "A failed download must not leave a cached package");
+        string downloaded = await updater.DownloadFirmware(online[0], cache, CancellationToken.None);
+        PagerUsb.LoadFirmware(downloaded, null, old.ToString(), FirmwareTarget.Pager);
+        Check(await updater.DownloadFirmware(online[0], cache, CancellationToken.None) == downloaded && downloads == 2,
+            "A verified older ZIP must be cached for future offline selection");
+    }
+    finally { Directory.Delete(root, recursive: true); }
+    Console.WriteLine("PASS firmware catalog compatibility, newest selection, older download, validation and offline cache");
 }
 
 static async Task TestGitHubUpdate(string settings, string firmware, string? baseFirmware, string? hotspotFirmware)
