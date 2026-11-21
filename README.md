@@ -1,10 +1,10 @@
-# TallyPager 0.13.0
+# TallyPager 0.14.0
 
 Tally und Chat für mobile Kameras mit dem M5StickC Plus2. Die Windows-App kann ATEM und vMix direkt lesen oder Tally Arbiter als Quelle verwenden. CameraCue 0.1.4 bleibt als eigener [Build für Tally Arbiter](CameraCue/README.md) verfügbar.
 
 ## Start und Einrichtung
 
-1. Für die portable Variante `TallyPager-Windows-x64.exe` und die benötigten Firmware-ZIPs aus `dist/0.13.0/` in denselben Ordner legen. Für die installierbare Variante `TallyPager-Setup-Windows-x64.exe` starten. Setup installiert die App und die drei Firmwarepakete im Windows-Benutzerkonto und legt einen Startmenüeintrag an. Die App läuft ab Windows 10 Version 2004 und benötigt keine separate .NET-Installation.
+1. Für die portable Variante `TallyPager-Windows-x64.exe` und die benötigten Firmware-ZIPs aus `dist/0.14.0/` in denselben Ordner legen. Für die installierbare Variante `TallyPager-Setup-Windows-x64.exe` starten. Setup installiert die App und die drei Firmwarepakete im Windows-Benutzerkonto und legt einen Startmenüeintrag an. Die App läuft ab Windows 10 Version 2004 und benötigt keine separate .NET-Installation.
 2. Unter **Stick einrichten/verwalten → USB** den Port, die **Adresse des Basis-Servers** im Kameranetz und den Sticknamen wählen. **Firmware lesen** zeigt die installierte Version und ihre Funktionen. **Firmware auswählen …** öffnet die passenden Pakete für das Gerät. **Stick einrichten** speichert die Einstellungen mit der bereits installierten Firmware.
 3. WLAN-Name und Passwort eingeben oder beide Felder für das gespeicherte WLAN leer lassen. Der Stick benötigt ein 2,4-GHz-WLAN und muss den PC oder die USB-WLAN-Brücke per UDP auf Port 46224 erreichen.
 4. Unter **Externe Verbindungen → Mixer und Zuordnung** die gewünschten Quellen verbinden. Einen Stick in der Tabelle auswählen, pro Ebene Quelle und Eingang wählen und die Zuordnung speichern. **Aus · ausblenden** entfernt Farbe und Quellzeile für diese Ebene. **Innen und außen tauschen** speichert den Tausch sofort. Der Stick zeigt die zugeordnete Quelle an, zum Beispiel `ATEM: LIVE`.
@@ -70,9 +70,11 @@ Für den Vergleich kann die Regie den aktiven Funkmodus und die RTT in der Stick
 ### Separates Pager-WLAN mit USB-Brücke
 
 1. Die Brücke per USB am Regie-PC anschließen und unter **Einstellungen Funkbasis-Modus** den COM-Port wählen. Für den M5Stick **M5Stick-Brücken-Firmware auswählen …** verwenden. Für den ESP8266MOD **ESP8266-Firmware auswählen …** verwenden. Danach beim ESP8266 oben **WLAN-Brücke** oder **WLAN-Brücke + ESP-NOW** auswählen und **Funkbasis einrichten** drücken.
-2. Oben **Funkbasis verbinden** anklicken. Die Brücke stellt ein eigenes 2,4-GHz-WLAN mit gerätespezifischem Namen und gespeichertem WPA2-Passwort bereit. Die App zeigt diese Daten auch beim ESP8266 ohne Display. Der Windows-PC bleibt für Tally per USB angeschlossen. ATEM und vMix bleiben über die gewohnte PC-Netzwerkverbindung erreichbar.
+2. Oben **Funkbasis verbinden** anklicken. Die Brücke stellt ein eigenes 2,4-GHz-WLAN mit gerätespezifischem Namen bereit. Standardmäßig schützt ein automatisch erzeugtes, gespeichertes WPA2-Passwort den Hotspot. Die App zeigt diese Daten auch beim ESP8266 ohne Display. Der Windows-PC bleibt für Tally per USB angeschlossen. ATEM und vMix bleiben über die gewohnte PC-Netzwerkverbindung erreichbar.
 3. **In Stick-Einrichtung übernehmen** füllt Modus, WLAN-Name, Passwort und Basis-Server aus. Den Pager zusätzlich per USB anschließen, seinen COM-Port wählen und **Stick einrichten** drücken. Bereits installierte Pager-Firmware mit WLAN + UDP genügt. Als Basis-Server ist im separaten WLAN `192.168.4.1` eingetragen. In der Gerätetabelle erscheint der Empfangsweg **WLAN-Brücke**.
 4. Ein zusätzlicher Geräteprofilplatz am Pager kann das bisherige Gemeinde-WLAN behalten. Der Hotspot unterstützt Kanal 1, 6 oder 11. Beim Kanalwechsel startet die Basis neu. Im Kombimodus müssen auch alle ESP-NOW-Pager auf dem neuen Kanal funken. Der ESP8266 verwendet in diesem Modus die MAC-Adresse seines Hotspots für ESP-NOW. Wer vom bisherigen reinen ESP-NOW-Modus wechselt, übernimmt die jetzt angezeigte Basisadresse in die ESP-NOW-Profile.
+
+Ab ESP8266-Firmware 0.14.0 lässt sich unter **WLAN-Brücke → WLAN-Schutz (ESP82)** ein eigenes WPA2-Passwort mit 8 bis 63 druckbaren ASCII-Zeichen einstellen oder ein offenes WLAN wählen. Das funktioniert auch im Kombimodus. **WLAN-Schutz speichern** startet die Brücke neu. Anschließend die WLAN-Pager mit den neuen Zugangsdaten einrichten. Über **WPA2 · automatisches Passwort** lässt sich das ursprüngliche automatisch erzeugte Passwort wieder aktivieren.
 
 Bei verbundener Brücke können bereits aktive Pager weiter über **Stick einrichten/verwalten → WLAN** verwaltet werden. Die separate WLAN-Suche über Windows durchsucht die Netzwerke des PCs. Um den M5Stick mit Brücken-Firmware wieder als Pager oder ESP-NOW-/BLE-Funkbasis zu verwenden, die Brücke in Windows trennen und unter **Stick einrichten/verwalten → USB → Firmware auswählen …** den Typ **M5StickC Plus2 · Pager und Funkbasis** flashen.
 

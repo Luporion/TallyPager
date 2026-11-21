@@ -21,12 +21,17 @@ internal sealed partial class MainWindow
             throw new InvalidDataException("Gespeicherte Geräteeinstellungen sind ungültig.")
         : new(new(StringComparer.Ordinal), new(StringComparer.Ordinal));
 
-    private static FlowLayoutPanel Reveal(TextBox field)
+    private static CheckBox PasswordReveal(TextBox field)
     {
         var reveal = new CheckBox { Text = "Anzeigen", AutoSize = true };
         reveal.CheckedChanged += (_, _) => field.UseSystemPasswordChar = !reveal.Checked;
+        return reveal;
+    }
+
+    private static FlowLayoutPanel Reveal(TextBox field)
+    {
         var actions = new FlowLayoutPanel { AutoSize = true, WrapContents = false };
-        actions.Controls.Add(reveal);
+        actions.Controls.Add(PasswordReveal(field));
         return actions;
     }
 

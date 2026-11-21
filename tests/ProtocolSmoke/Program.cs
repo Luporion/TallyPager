@@ -74,6 +74,7 @@ try
     TestRadioBridge(settings);
     await TestHotspotBridge(settings);
     TestHybridBridge(settings);
+    TestHotspotSecurity();
     TestBasePreview(settings);
     await TestRemoteSlots(settings);
     TestRadioFragments();
@@ -820,6 +821,55 @@ static void TestRadioFragments()
     Check(radio.Receive(frames[^1], 405) == payload && radio.Receive(frames[^1], 406) is null,
         "Five fragments must reassemble exactly once");
     Console.WriteLine("PASS BLE packet layout, fragmentation and incomplete sequences");
+}
+
+static void TestHotspotSecurity()
+{
+    const string report = """
+        TP {"id":"10061c286f4c","board":"esp8266","baseRole":true,"mode":"espnow-hotspot",
+        "radioReady":true,"ip":"192.168.4.1","hotspotSsid":"TallyPager-286f4c",
+        "version":"0.14.0","features":["hotspot","espnow-hotspot","hotspot-security"],
+        "hotspotSecurity":"open","hotspotPassword":""}
+        """;
+    var open = PagerUsb.ParseStatus(report.ReplaceLineEndings(""));
+    Check(open is { CanConfigureHotspotSecurity: true, HasHotspotCredentials: true },
+        "An explicitly open ESP8266 bridge must be usable with a blank password");
+    var legacy = open! with { Version = "0.13.0", Features = ["hotspot"], HotspotSecurity = "" };
+    Check(!legacy.CanConfigureHotspotSecurity && !legacy.HasHotspotCredentials &&
+        (legacy with { HotspotPassword = "0123456789abcdef" }).HasHotspotCredentials,
+        "Legacy hotspot credentials must still work and missing passwords must not imply an open network");
+    Check(!(open! with { Board = "m5stick-cplus2" }).CanConfigureHotspotSecurity &&
+        !(open! with { Mode = "espnow" }).CanConfigureHotspotSecurity,
+        "The password editor applies only to ESP8266 modes with a hotspot");
+
+    string[] valid = ["Demo 42!", " quotes \" and \\ stay ", new('a', 63)];
+    foreach (string key in valid)
+    {
+        using var custom = JsonDocument.Parse(PagerUsb.HotspotSecurityCommand("custom", key)["TP AP ".Length..]);
+        Check(custom.RootElement.GetProperty("security").GetString() == "custom" &&
+            custom.RootElement.GetProperty("password").GetString() == key &&
+            (open! with { HotspotSecurity = "custom", HotspotPassword = key }).HasHotspotCredentials,
+            "Custom WPA2 keys must round-trip unchanged");
+    }
+    string[] invalid = ["", "1234567", new('a', 64), "Müller-42", "secret\0more"];
+    foreach (string key in invalid)
+    {
+        Check(!PagerUsb.IsHotspotPassword(key), "Invalid WPA2 key must be rejected");
+        try
+        {
+            PagerUsb.HotspotSecurityCommand("custom", key);
+            throw new InvalidOperationException("Invalid WPA2 key reached the USB command");
+        }
+        catch (ArgumentException) { }
+    }
+    foreach (string mode in new[] { "open", "automatic" })
+    {
+        using var option = JsonDocument.Parse(PagerUsb.HotspotSecurityCommand(mode, valid[0])["TP AP ".Length..]);
+        Check(option.RootElement.GetProperty("security").GetString() == mode &&
+            option.RootElement.GetProperty("password").GetString() == "",
+            "Only custom mode should send a password over USB");
+    }
+    Console.WriteLine("PASS ESP8266 hotspot security choices, WPA2 validation and legacy compatibility");
 }
 
 static async Task TestHotspotBridge(string settings)

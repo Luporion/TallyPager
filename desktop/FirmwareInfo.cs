@@ -9,6 +9,7 @@ internal sealed class FirmwareInfo
     public const string RemoteSlots = "remote-slots";
     public const string TallyLabels = "tally-labels";
     public const string DisplayPower = "display-power";
+    public const string HotspotSecurity = "hotspot-security";
     private static readonly Dictionary<string, string> Known = new(StringComparer.Ordinal)
     {
         [Usb] = "USB-Einrichtung",
@@ -20,6 +21,7 @@ internal sealed class FirmwareInfo
         [RadioBase] = "Funkbasis",
         [Transport.Hotspot] = "WLAN-Brücke per USB",
         [Transport.Hybrid] = "WLAN-Brücke und ESP-NOW gleichzeitig",
+        [HotspotSecurity] = "WLAN-Schutz der Brücke einstellen",
         ["espnow"] = "ESP-NOW",
         ["espnow-lr"] = "ESP-NOW LR",
         ["ble"] = "BLE",
@@ -85,7 +87,7 @@ internal sealed class FirmwareInfo
     public string ShortVersion => !ExactVersion ? $"≥ {VersionText}" :
         Older ? VersionText + " · älter" : Newer ? VersionText + " · neuer" : VersionText;
 
-    public string[] Missing => features is null ? [] : Known.Where(pair => pair.Key is not (Transport.Hotspot or Transport.Hybrid) && !Supports(pair.Key))
+    public string[] Missing => features is null ? [] : Known.Where(pair => pair.Key is not (Transport.Hotspot or Transport.Hybrid or HotspotSecurity) && !Supports(pair.Key))
         .Select(pair => pair.Value).ToArray();
     public string[] Available => features is null ? [] : Known.Where(pair => Supports(pair.Key)).Select(pair => pair.Value).ToArray();
     public string[] Unknown => features is null ? [] : features.Where(id => !Known.ContainsKey(id)).ToArray();

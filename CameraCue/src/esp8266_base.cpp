@@ -13,10 +13,16 @@ namespace {
 using namespace radio_frame;
 enum class Mode : uint8_t { EspNow, Hotspot, Both };
 Mode mode = Mode::EspNow;
-constexpr size_t passwordLength = 16;
+constexpr size_t automaticLength = 16, maxPasswordLength = 63;
 constexpr int passwordStored = 3, passwordOffset = 4;
+// Keep the original key and layout so automatic mode and older firmware can still use it.
+constexpr int securityOffset = passwordOffset + automaticLength;
+constexpr int customLengthOffset = securityOffset + 1, customPasswordOffset = customLengthOffset + 1;
+constexpr int securitySize = 2 + maxPasswordLength;
+enum class Security : uint8_t { Automatic = 0xff, Custom = 0x50, Open = 0x4f };
+Security security = Security::Automatic;
 hotspot::Link wifiLink;
-char wifiPassword[passwordLength + 1]{};
+char wifiPassword[maxPasswordLength + 1]{};
 String wifiName;
 bool wifiReady = false, espNowReady = false;
 constexpr unsigned receiveSlots = 17;
@@ -62,20 +68,48 @@ const char* modeName() {
   return mode == Mode::Both ? "espnow-hotspot" : mode == Mode::Hotspot ? "hotspot" : "espnow";
 }
 
+bool validPassword(const char* password, size_t length) {
+  if (!password || length < 8 || length > maxPasswordLength) return false;
+  for (size_t i = 0; i < length; ++i)
+    if (password[i] < ' ' || password[i] > '~') return false;
+  return true;
+}
+
+const char* securityName() {
+  return security == Security::Custom ? "custom" : security == Security::Open ? "open" : "automatic";
+}
+
 bool loadPassword() {
+  auto stored = static_cast<Security>(EEPROM.read(securityOffset));
+  if (stored == Security::Open) {
+    security = stored;
+    return true;
+  }
+  if (stored == Security::Custom) {
+    size_t length = EEPROM.read(customLengthOffset);
+    if (length <= maxPasswordLength) {
+      for (size_t i = 0; i < length; ++i) wifiPassword[i] = EEPROM.read(customPasswordOffset + i);
+      if (validPassword(wifiPassword, length)) {
+        wifiPassword[length] = '\0';
+        security = stored;
+        return true;
+      }
+    }
+  }
+  wifiPassword[automaticLength] = '\0';
   if (EEPROM.read(passwordStored) == 0x58) {
     bool valid = true;
-    for (unsigned i = 0; i < passwordLength; ++i) {
+    for (size_t i = 0; i < automaticLength; ++i) {
       char ch = EEPROM.read(passwordOffset + i);
       valid &= (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
       wifiPassword[i] = ch;
     }
     if (valid) return true;
   }
-  uint8_t random[passwordLength / 2];
+  uint8_t random[automaticLength / 2];
   ESP.random(random, sizeof(random));
   constexpr char hex[] = "0123456789abcdef";
-  for (unsigned i = 0; i < passwordLength; ++i) {
+  for (size_t i = 0; i < automaticLength; ++i) {
     wifiPassword[i] = hex[(random[i / 2] >> (i % 2 ? 0 : 4)) & 15];
     EEPROM.write(passwordOffset + i, wifiPassword[i]);
   }
@@ -83,6 +117,33 @@ bool loadPassword() {
   if (EEPROM.commit()) return true;
   wifiPassword[0] = '\0';
   return false;
+}
+
+void configureSecurity(const char* json) {
+  JsonDocument doc;
+  if (!hasHotspot() || restartAt || deserializeJson(doc, json)) { Serial.println("TP ERROR security"); return; }
+  auto name = doc["security"].as<JsonString>();
+  auto password = doc["password"].as<JsonString>();
+  Security requested;
+  if (name == "automatic") requested = Security::Automatic;
+  else if (name == "open") requested = Security::Open;
+  else if (name == "custom" && validPassword(password.c_str(), password.size())) requested = Security::Custom;
+  else { Serial.println("TP ERROR security"); return; }
+
+  uint8_t backup[securitySize];
+  for (int i = 0; i < securitySize; ++i) backup[i] = EEPROM.read(securityOffset + i);
+  size_t length = requested == Security::Custom ? password.size() : 0;
+  EEPROM.write(securityOffset, static_cast<uint8_t>(requested));
+  EEPROM.write(customLengthOffset, length);
+  for (size_t i = 0; i < maxPasswordLength; ++i)
+    EEPROM.write(customPasswordOffset + i, i < length ? password.c_str()[i] : 0);
+  if (!EEPROM.commit()) {
+    for (int i = 0; i < securitySize; ++i) EEPROM.write(securityOffset + i, backup[i]);
+    Serial.println("TP ERROR eeprom");
+    return;
+  }
+  Serial.println("TP OK");
+  restartAt = millis() + 350;
 }
 
 void receiveFrame(uint8_t* address, uint8_t* bytes, uint8_t length) {
@@ -107,6 +168,7 @@ void status() {
   if (espNowReady) doc["radioAddress"] = mac(nowAddress);
   doc["channel"] = channel;
   doc["radioReady"] = ready;
+  if (hasHotspot()) doc["hotspotSecurity"] = securityName();
   if (wifiReady) {
     doc["ip"] = hotspot::gateway.toString();
     doc["hotspotSsid"] = wifiName;
@@ -117,6 +179,7 @@ void status() {
   features.add("espnow");
   features.add("hotspot");
   features.add("espnow-hotspot");
+  features.add("hotspot-security");
   Serial.print("TP ");
   serializeJson(doc, Serial);
   Serial.println();
@@ -125,6 +188,7 @@ void status() {
 void command() {
   line[used] = 0;
   if (strcmp(line, "TP STATUS") == 0) { status(); return; }
+  if (strncmp(line, "TP AP ", 6) == 0) { configureSecurity(line + 6); return; }
   if (strncmp(line, "TP BASE ", 8) == 0) {
     JsonDocument doc;
     if (deserializeJson(doc, line + 8) || !doc["channel"].is<int>()) { Serial.println("TP ERROR mode"); return; }
@@ -200,7 +264,7 @@ void radioTick() {
 }
 
 void setup() {
-  EEPROM.begin(passwordOffset + passwordLength);
+  EEPROM.begin(securityOffset + securitySize);
   uint8_t stored = EEPROM.read(1);
   if (EEPROM.read(0) == 0x54) {
     uint8_t savedMode = EEPROM.read(2);
@@ -219,7 +283,8 @@ void setup() {
   if (hasHotspot()) {
     wifiName = "TallyPager-" + mac(deviceAddress).substring(6);
     wifiReady = loadPassword() && WiFi.mode(WIFI_AP) && WiFi.softAPConfig(hotspot::gateway, hotspot::gateway, hotspot::mask) &&
-        WiFi.softAP(wifiName.c_str(), wifiPassword, channel, false, hotspot::maxClients) && wifiLink.begin();
+        WiFi.softAP(wifiName.c_str(), security == Security::Open ? nullptr : wifiPassword,
+            channel, false, hotspot::maxClients) && wifiLink.begin();
     if (wifiReady) WiFi.softAPmacAddress(nowAddress);
     else WiFi.mode(WIFI_OFF);
   }

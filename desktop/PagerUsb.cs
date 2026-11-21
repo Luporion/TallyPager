@@ -12,9 +12,13 @@ internal sealed record UsbStatus(string Version, string Id, bool Configured, boo
     bool Core, int Inside, int Outside, string Cue, string Next, string Mode = "udp",
     bool BaseRole = false, string RadioAddress = "", int Channel = 6, bool RadioReady = false,
     string[]? Features = null, int Slot = 0, string Board = "m5stick-cplus2",
-    string HotspotSsid = "", string HotspotPassword = "")
+    string HotspotSsid = "", string HotspotPassword = "", string HotspotSecurity = "")
 {
     public FirmwareInfo? Firmware => FirmwareInfo.Read(Version, Features);
+    public bool CanConfigureHotspotSecurity => Board == "esp8266" && BaseRole && Transport.Serves(Mode, Transport.Hotspot) &&
+        Firmware?.Supports(FirmwareInfo.HotspotSecurity) == true;
+    public bool HasHotspotCredentials => RadioReady && Ip == Transport.HotspotIp && HotspotSsid.Length > 0 &&
+        (HotspotSecurity == "open" ? CanConfigureHotspotSecurity && HotspotPassword == "" : PagerUsb.IsHotspotPassword(HotspotPassword));
     public string BoardName => Board switch
     {
         "m5stick-cplus2" => Mode == Transport.Hotspot ? "M5StickC Plus2 · WLAN-Brücke" : "M5StickC Plus2",
@@ -29,7 +33,7 @@ internal sealed record UsbHardware(FirmwareTarget? Target, string Description);
 
 internal static class PagerUsb
 {
-    public const string Version = "0.13.0";
+    public const string Version = "0.14.0";
     public const string Esp8266FirmwareFileName = "TallyPager-Firmware-ESP8266-" + Version + ".zip";
     public const string HotspotFirmwareFileName = "TallyPager-Firmware-WLAN-Bruecke-M5StickC-Plus2-" + Version + ".zip";
     private const int StandardBaud = 115200, HotspotBaud = 460800;
@@ -143,21 +147,43 @@ internal static class PagerUsb
             status => status.Mode == Transport.Hotspot && status.RadioReady && status.Channel == channel);
     }
 
+    internal static bool IsHotspotPassword(string password) =>
+        password.Length is >= 8 and <= 63 && password.All(c => c is >= ' ' and <= '~');
+
+    internal static string HotspotSecurityCommand(string security, string password)
+    {
+        var payload = security switch
+        {
+            "automatic" or "open" => new { security, password = "" },
+            "custom" when IsHotspotPassword(password) => new { security, password },
+            "custom" => throw new ArgumentException("Das WPA2-Passwort muss 8 bis 63 druckbare ASCII-Zeichen enthalten."),
+            _ => throw new ArgumentOutOfRangeException(nameof(security))
+        };
+        return "TP AP " + JsonSerializer.Serialize(payload, Json);
+    }
+
+    public static UsbStatus ConfigureHotspotSecurity(string port, UsbStatus previous, string security, string password) =>
+        SetRole(port, previous.Id, status => status.CanConfigureHotspotSecurity && status.Mode == previous.Mode &&
+            status.Channel == previous.Channel, HotspotSecurityCommand(security, password),
+            status => status.CanConfigureHotspotSecurity && status.HasHotspotCredentials && status.Mode == previous.Mode &&
+            status.Channel == previous.Channel && status.HotspotSecurity == security &&
+            (security != "custom" || status.HotspotPassword == password));
+
     private static UsbStatus SetRole(string port, string id, Func<UsbStatus, bool> supports, string command, Func<UsbStatus, bool> ready)
     {
         using (var serial = Open(port))
         {
             var current = ReadStatus(serial, TimeSpan.FromSeconds(4));
             if (current.Id != id || !supports(current))
-                throw new InvalidOperationException("Der Stick am USB-Port unterstützt diese Rollenänderung nicht.");
+                throw new InvalidOperationException("Das Gerät am USB-Port unterstützt diese Änderung nicht oder wurde inzwischen gewechselt.");
             serial.WriteLine(command);
             if (ReadReply(serial, TimeSpan.FromSeconds(4), "TP OK", "TP ERROR ") != "TP OK")
-                throw new InvalidOperationException("Der Stick hat die Rolle nicht bestätigt.");
+                throw new InvalidOperationException("Das Gerät hat die Änderung nicht bestätigt.");
         }
         Thread.Sleep(1400);
         var status = ReadStatus(port, TimeSpan.FromSeconds(8));
         return status.Id == id && ready(status) ? status :
-            throw new InvalidOperationException("Die gewünschte Rolle ist am Stick nicht betriebsbereit.");
+            throw new InvalidOperationException("Die Änderung konnte nach dem Neustart nicht bestätigt werden.");
     }
 
     internal static readonly (string Offset, string Name, long Limit)[] Images =
